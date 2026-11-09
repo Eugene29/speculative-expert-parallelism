@@ -16,3 +16,6 @@ packages = ["spec_ep"]
 
 [tool.setuptools.package-dir]
 spec_ep = "src"
+
+[tool.pytest.ini_options]
+markers = ["smoke: the one RBD layout to run during development, with -m smoke"]
