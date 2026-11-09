@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spec-ep"
+version = "0.1.0"
+description = "Speculative expert parallelism communication for MoE models."
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+# src/ installs as spec_ep, so `from spec_ep.rbd import RBD_combine_dispatch` works
+# from any repo. Install into the env with: pip install -e . --no-build-isolation
+[tool.setuptools]
+packages = ["spec_ep"]
+
+[tool.setuptools.package-dir]
+spec_ep = "src"
