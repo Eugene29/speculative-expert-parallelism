@@ -25,3 +25,12 @@ source ~/conda_trick.sh
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 echo Running benchmark...
+# srun -N 2 --ntasks-per-node=4 python -u -m benchmark.all2all.rbd_vs_plain \
+#   logs/2026_oct/2026-10-16_14-07-50 0
+
+srun -N 2 --ntasks-per-node=4 python -u benchmark/internode/expert_all2all.py \
+  --balance even
+
+# echo \n\n\n
+# srun -N 2 --ntasks-per-node=4 python -u benchmark/internode/expert_all2all.py \
+  # --balance uneven_internode

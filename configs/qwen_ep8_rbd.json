@@ -1,0 +1,11 @@
+{
+  "train_micro_batch_size_per_gpu": 16,
+  "expert_parallel": {
+    "enabled": true,
+    "autoep_size": 8,
+    "preset_model": "qwen3_5_moe",
+    "use_grouped_mm": true,
+    "comm_backend": "rbd",
+    "comm_rbd_pilot": "rail"
+  }
+}
