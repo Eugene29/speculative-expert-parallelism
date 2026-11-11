@@ -1,0 +1,9 @@
+[submodule "DeepEP"]
+	path = DeepEP
+	url = https://github.com/deepseek-ai/DeepEP.git
+[submodule "Tutel"]
+	path = Tutel
+	url = https://github.com/microsoft/Tutel
+[submodule "DeepSpeed"]
+	path = DeepSpeed
+	url = https://github.com/Eugene29/DeepSpeed-for-spec-EP.git
