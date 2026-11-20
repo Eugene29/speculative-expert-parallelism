@@ -26,7 +26,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import check_placement, init_dist
+from benchmark.utils import check_node_layout, init_dist
 
 
 def get_ring_peers(rank: int, world: int, gpus_per_node: int) -> tuple[int, int]:
@@ -92,7 +92,7 @@ def main(args: argparse.Namespace) -> None:
     """Run the ring benchmark for each expert count and print results on rank 0."""
     rank, world, device = init_dist()
     gpus_per_node = world // int(os.environ["SLURM_NNODES"])
-    hosts = check_placement(gpus_per_node)
+    hosts = check_node_layout(gpus_per_node)
     next_rank, prev_rank = get_ring_peers(rank, world, gpus_per_node)
     dtype = getattr(torch, args.dtype)
 

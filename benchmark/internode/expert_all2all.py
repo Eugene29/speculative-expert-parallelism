@@ -34,7 +34,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import check_placement, init_dist
+from benchmark.utils import check_node_layout, init_dist
 
 
 def get_splits(
@@ -155,7 +155,7 @@ def main(args: argparse.Namespace) -> None:
     """Run the all-to-all benchmark for each expert count and print results on rank 0."""
     rank, world, device = init_dist()
     gpus_per_node = world // int(os.environ["SLURM_NNODES"])
-    hosts = check_placement(gpus_per_node)
+    hosts = check_node_layout(gpus_per_node)
     dtype = getattr(torch, args.dtype)
 
     if rank == 0:

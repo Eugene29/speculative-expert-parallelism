@@ -1,6 +1,6 @@
 """Integration tests for Redundancy-Bypassing Dispatch (spec_ep.rbd).
 
-Each test spawns one CPU process per rank over gloo and runs RBD_combine_dispatch
+Each test spawns one CPU process per rank over gloo and runs rbd_combine_dispatch
 end to end. Layouts follow Perlmutter, 4 GPUs per node. Each layout spawns once and
 loops over every pilot rule and routing inside the workers, since starting the
 processes costs far more than one RBD call.
@@ -23,14 +23,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from spec_ep.rbd import RBD_combine_dispatch
+from spec_ep.rbd import PILOT_RULES, rbd_combine_dispatch
 
 GPUS_PER_NODE = 4
 EXPERTS_PER_RANK = 4
 NUM_TOKENS = 16
 HIDDEN = 4
 TOP_K = 4
-PILOTS = ["rail", "first", "most", "even"]
 
 
 class Layout(NamedTuple):
@@ -112,7 +111,7 @@ def _reference(tokens: torch.Tensor, weights: torch.Tensor, route: torch.Tensor)
 def _check_rbd(rank: int, init_file: Path, layout: Layout) -> None:
     """Run RBD on one rank for every pilot rule and routing, and check its output.
 
-    Runs RBD_combine_dispatch once per pilot rule in PILOTS and routing in
+    Runs rbd_combine_dispatch once per pilot rule in PILOT_RULES and routing in
     ROUTINGS, with experts that scale their rows by 1 + expert id, and compares the
     output with _reference(). A mismatch names the rank, pilot rule and routing.
 
@@ -142,28 +141,28 @@ def _check_rbd(rank: int, init_file: Path, layout: Layout) -> None:
         ep_rank = dist.get_rank(group=ep_group)
         E = EXPERTS_PER_RANK * layout.ep_size
 
-        for p, pilot in enumerate(PILOTS):
+        for p, pilot_rule in enumerate(PILOT_RULES):
             for r, (name, make_route) in enumerate(ROUTINGS.items()):
                 gen = torch.Generator().manual_seed(1000 * rank + 10 * p + r)
                 route = make_route(gen, ep_rank, E)
                 tokens = torch.randn(route.shape[0], HIDDEN, generator=gen, dtype=torch.float64)
                 weights = torch.rand(route.shape, generator=gen)
 
-                output = RBD_combine_dispatch(
+                output = rbd_combine_dispatch(
                     tokens,
                     weights,
                     _scale_by_expert,
                     route,
-                    E=E,
+                    num_experts=E,
                     gpus_per_node=GPUS_PER_NODE,
                     local_group=local_group,
                     ep_group=ep_group,
-                    pilot=pilot,
+                    pilot_rule=pilot_rule,
                 )
                 torch.testing.assert_close(
                     output,
                     _reference(tokens, weights, route),
-                    msg=lambda m: f"rank={rank} pilot={pilot} routing={name}: {m}",
+                    msg=lambda m: f"rank={rank} pilot_rule={pilot_rule} routing={name}: {m}",
                 )
     finally:
         dist.destroy_process_group()

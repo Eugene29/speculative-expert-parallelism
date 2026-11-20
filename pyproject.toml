@@ -9,7 +9,7 @@ description = "Speculative expert parallelism communication for MoE models."
 requires-python = ">=3.10"
 dependencies = ["torch"]
 
-# src/ installs as spec_ep, so `from spec_ep.rbd import RBD_combine_dispatch` works
+# src/ installs as spec_ep, so `from spec_ep.rbd import rbd_combine_dispatch` works
 # from any repo. Install into the env with: pip install -e . --no-build-isolation
 [tool.setuptools]
 packages = ["spec_ep"]
