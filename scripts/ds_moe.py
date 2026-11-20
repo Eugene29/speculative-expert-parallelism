@@ -16,7 +16,7 @@ from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 from pathlib import Path
 
 from utils import print0, shutdown_comm, get_rank_and_world_size
-from utils_profile import count_params, end_flops_profile, add_expert_statistics_hook, record_function, report_peak_mem, save_torch_profile, start_flops_profile, torch_profile_ctx
+from utils_profile import AutoEPMoELayer, count_params, end_flops_profile, add_expert_statistics_hook, record_function, report_peak_mem, save_torch_profile, start_flops_profile, torch_profile_ctx
 
 
 rank, world_size = get_rank_and_world_size()
@@ -61,6 +61,23 @@ def init_deepspeed(model, ds_config_pth):
     return engine
     
     
+def switch_comm(engine, ds_config_pth):
+    """Switch every AutoEP layer to another config's communication settings.
+
+    Lets one job time several comm backends on the same loaded model and nodes.
+    Only the expert_parallel comm_* keys are applied; nothing is re-validated, so
+    pass the most demanding config to deepspeed.initialize first.
+    """
+    with open(ds_config_pth, 'r') as file:
+        ep = json.load(file)["expert_parallel"]
+    for layer in engine.module.modules():
+        if isinstance(layer, AutoEPMoELayer):
+            layer.comm_backend = ep.get("comm_backend", "comm")
+            layer.comm_rbd_pilot = ep.get("comm_rbd_pilot", "rail")
+            layer.comm_rbd_pipeline_degree = ep.get("comm_rbd_pipeline_degree", 1)
+            layer._bind_rbd_node_group()
+
+
 def get_batch(model_id, dev, seq_len):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
@@ -110,18 +127,23 @@ def record_latency(engine, batch):
     # TFlops_per_gpu = total_flop_count / dur / 1e12 / world_size
     # print(f"[{rank}] real TFlops: {TFlops_per_gpu}", flush=True)
     
-def run_pytorch_profile(engine, batch):
+def run_pytorch_profile(engine, batch, outdir=logs):
     """Run pytorch profiler"""
     with torch_profile_ctx() as tprof:
         with record_function("forward"):
             outputs = engine(**batch, use_cache=False)
         torch.cuda.synchronize(engine.device)
-    save_torch_profile(tprof, outdir=logs)
+    save_torch_profile(tprof, outdir=outdir, verbose=True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config-pth", type=str, default="configs/qwen_ep8.json",
-                        help="Path to the DeepSpeed config-pth (e.g. configs/qwen_ep4.json)")
+    parser.add_argument("--config-pth", type=str, nargs="+", default=["configs/qwen_ep8.json"],
+                        help="Path to the DeepSpeed config-pth (e.g. configs/qwen_ep4.json). With several, "
+                             "the model is loaded once with the first and the others only switch the "
+                             "AutoEP comm settings; each gets its own LOGS/<config name>/profile")
+    parser.add_argument("--model", type=str, default="/pscratch/sd/e/eku/spec_ep/models/Qwen3.6-35B-A3B",
+                        help="Model directory; must be a qwen3_5_moe checkpoint")
+    parser.add_argument("--seq-len", type=int, default=4096, help="Tokens per rank")
     # deepspeed launcher may inject --local_rank; ignore unknown args
     args, _ = parser.parse_known_args()
     return args
@@ -143,31 +165,37 @@ def run_ds_comm_profile(engine, batch):
     dist.log_summary(show_straggler=True)   # collective; call on ALL ranks
 
 def main():
-    model_id = "/pscratch/sd/e/eku/spec_ep/models/Qwen3.6-35B-A3B"
-    seq_len = 4096
     args = parse_args()
+    model_id, seq_len = args.model, args.seq_len
 
     model = load_model(model_id)
-    engine = init_deepspeed(model, args.config_pth)
+    engine = init_deepspeed(model, args.config_pth[0])
     batch = get_batch(model_id, engine.device, seq_len)
 
     with torch.inference_mode():
-        # compile + warmup
-        # print0("first")
-        # record_latency(engine, batch)
-        # engine.compile()
-        record_latency(engine, batch)
-        # record_latency(engine, batch)
-        # record_latency(engine, batch)
+        for config_pth in args.config_pth:
+            outdir = logs
+            if len(args.config_pth) > 1:
+                switch_comm(engine, config_pth)
+                outdir = logs / Path(config_pth).stem
+                (outdir / "profile").mkdir(parents=True, exist_ok=True)
+                print0(f"=== {config_pth}")
+            # compile + warmup
+            # print0("first")
+            # record_latency(engine, batch)
+            # engine.compile()
+            record_latency(engine, batch)
+            record_latency(engine, batch)
+            record_latency(engine, batch)
 
-        run_ds_flops_profile(engine, batch)
+            # run_ds_flops_profile(engine, batch)
 
-        # engine(**batch, use_cache=False)
-        # record_expert_routing(engine, batch)
-        # record_latency(engine, batch)
-        # run_ds_comm_profile(engine, batch)
-        # run_pytorch_profile(engine, batch)
-        # run_ds_flops_profile(engine, batch)
+            # engine(**batch, use_cache=False)
+            # record_expert_routing(engine, batch)
+            # record_latency(engine, batch)
+            # run_ds_comm_profile(engine, batch)
+            run_pytorch_profile(engine, batch, outdir)
+            # run_ds_flops_profile(engine, batch)
 
     # bookeeping
     report_peak_mem(engine.device)

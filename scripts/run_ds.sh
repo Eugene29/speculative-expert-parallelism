@@ -28,8 +28,12 @@ source ~/conda_trick.sh
 # TODO: install tutel
 # TODO: Try tutel and DeepEP and profile them
 
-srun --ntasks-per-node=4 $python -u scripts/ds_moe.py \
-    --config-pth="configs/qwen_ep4.json" \
+# CONFIG picks the DeepSpeed config (several, space separated, share one model load and only
+# switch the comm backend), MODEL another qwen3_5_moe checkpoint, SEQ_LEN the tokens
+# per rank, and SRUN_ARGS narrows the step (e.g. "-N 1 -w <first node>" for EP4 on one node).
+srun ${SRUN_ARGS:-} --ntasks-per-node=${TASKS_PER_NODE:-4} $python -u scripts/ds_moe.py \
+    --config-pth ${CONFIG:-configs/qwen_ep4.json} \
+    ${MODEL:+--model "$MODEL"} ${SEQ_LEN:+--seq-len "$SEQ_LEN"} \
     2>&1 | tee "$LOGS/run.log"
 # Q. need --gpu-bind=none?
     # --config-pth="configs/qwen_ep8.json" \
