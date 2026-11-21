@@ -22,7 +22,7 @@ import argparse
 import glob
 import json
 import os
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 KINDS = ("transfer", "experts", "copy and fill", "other")
 COLORS = dict(zip(KINDS, ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")))
@@ -30,20 +30,26 @@ PHASE_COLOR, INK, MUTED, GRID, SURFACE = "#c3c2b7", "#0b0b0b", "#898781", "#e1e0
 
 
 class Event(NamedTuple):
-    """One GPU kernel, memcpy or memset, or one CPU-side phase."""
+    """One GPU kernel, memcpy or memset, or one CPU-side phase.
+
+    start_ms counts from the start of the forward's first phase. A phase has
+    gpu_stream 0.
+    """
 
     name: str
-    start: float  # ms after the forward's first phase started
-    dur: float    # ms
-    kind: str     # one of KINDS, or "phase"
-    lane: int     # GPU stream, or 0 for phases
+    start_ms: float
+    dur_ms: float
+    kind: Literal["transfer", "experts", "copy and fill", "other", "phase"]
+    gpu_stream: int
 
 
 def load_events(path: str) -> list[Event]:
     """Read one trace into GPU events and CPU phases on a shared clock.
 
     A phase is a record_function span named "<mode>/<step>", timed on the CPU side:
-    when the call that launched its work started and returned.
+    when the call that launched its work started and returned. The forward starts
+    with its first phase, so GPU events before it, such as the barrier that lines the
+    ranks up, are left out.
 
     Returns:
         events: Every GPU event and phase, by start time.
@@ -56,9 +62,8 @@ def load_events(path: str) -> list[Event]:
         (e["ts"], e["ts"] + e["dur"], e["tid"]) for e in raw
         if e.get("cat") == "gpu_user_annotation" and e["name"].endswith("experts")
     ]
-    # The forward starts at its first phase; the barrier before it is not part of it.
-    origin = min(e["ts"] for e in phases)
-    gpu = [e for e in gpu if e["ts"] >= origin]
+    forward_start = min(e["ts"] for e in phases)
+    gpu = [e for e in gpu if e["ts"] >= forward_start]
 
     def kind(event: dict) -> str:
         if event["cat"] != "kernel":
@@ -70,13 +75,13 @@ def load_events(path: str) -> list[Event]:
 
     streams = sorted({e["tid"] for e in gpu})
     events = [
-        Event(e["name"], (e["ts"] - origin) / 1e3, e["dur"] / 1e3, kind(e), streams.index(e["tid"]))
+        Event(e["name"], (e["ts"] - forward_start) / 1e3, e["dur"] / 1e3, kind(e), streams.index(e["tid"]))
         for e in gpu
     ]
     events += [
-        Event(e["name"], (e["ts"] - origin) / 1e3, e["dur"] / 1e3, "phase", 0) for e in phases
+        Event(e["name"], (e["ts"] - forward_start) / 1e3, e["dur"] / 1e3, "phase", 0) for e in phases
     ]
-    return sorted(events, key=lambda e: e.start)
+    return sorted(events, key=lambda e: e.start_ms)
 
 
 def short(name: str) -> str:
@@ -93,22 +98,22 @@ def short(name: str) -> str:
 def report(mode: str, events: list[Event]) -> None:
     """Print one mode's GPU time by kind, its phases and its five longest kernels."""
     gpu = [e for e in events if e.kind != "phase"]
-    wall = max(e.start + e.dur for e in gpu) - min(e.start for e in gpu)
-    by_kind = {k: sum(e.dur for e in gpu if e.kind == k) for k in KINDS}
+    wall = max(e.start_ms + e.dur_ms for e in gpu) - min(e.start_ms for e in gpu)
+    by_kind = {k: sum(e.dur_ms for e in gpu if e.kind == k) for k in KINDS}
     print(f"\n{mode}: {wall:.2f} ms from first to last GPU event")
     print("  GPU time: " + " | ".join(f"{k} {by_kind[k]:.2f} ms" for k in KINDS))
 
     phases = {}
     for e in events:
         if e.kind == "phase":
-            phases[e.name] = phases.get(e.name, 0) + e.dur
+            phases[e.name] = phases.get(e.name, 0) + e.dur_ms
     print("  CPU-side phases: " + " | ".join(f"{n.split('/')[1]} {d:.2f}" for n, d in phases.items()))
 
     by_name = {}
     for e in gpu:
         key = (e.kind, short(e.name))
         total, count = by_name.get(key, (0, 0))
-        by_name[key] = (total + e.dur, count + 1)
+        by_name[key] = (total + e.dur_ms, count + 1)
     for (kind, name), (total, count) in sorted(by_name.items(), key=lambda x: -x[1][0])[:5]:
         print(f"    {total:8.3f} ms  x{count:<4d} [{kind}] {name}")
 
@@ -120,8 +125,8 @@ def draw(traces: dict[str, list[Event]], path: str) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    lanes = {mode: 1 + max(e.lane for e in events if e.kind != "phase") for mode, events in traces.items()}
-    end = max(e.start + e.dur for events in traces.values() for e in events)
+    lanes = {mode: 1 + max(e.gpu_stream for e in events if e.kind != "phase") for mode, events in traces.items()}
+    end = max(e.start_ms + e.dur_ms for events in traces.values() for e in events)
     fig, axes = plt.subplots(
         len(traces), 1, sharex=True, squeeze=False, facecolor=SURFACE,
         figsize=(11, 0.45 * sum(lanes.values()) + 0.95 * len(traces) + 0.9),
@@ -131,13 +136,13 @@ def draw(traces: dict[str, list[Event]], path: str) -> None:
         ax.set_facecolor(SURFACE)
         for e in events:
             if e.kind == "phase":
-                ax.barh(0, e.dur, left=e.start, height=0.7, color=PHASE_COLOR,
+                ax.barh(0, e.dur_ms, left=e.start_ms, height=0.7, color=PHASE_COLOR,
                         edgecolor=SURFACE, linewidth=1)
-                if e.dur > end / 28:
-                    ax.text(e.start + e.dur / 2, 0, e.name.split("/")[1], ha="center",
+                if e.dur_ms > end / 28:
+                    ax.text(e.start_ms + e.dur_ms / 2, 0, e.name.split("/")[1], ha="center",
                             va="center", fontsize=7, color=INK, clip_on=True)
             else:
-                ax.barh(1 + e.lane, max(e.dur, end / 2500), left=e.start, height=0.7,
+                ax.barh(1 + e.gpu_stream, max(e.dur_ms, end / 2500), left=e.start_ms, height=0.7,
                         color=COLORS[e.kind], linewidth=0)
         ax.set_yticks(range(lanes[mode] + 1))
         ax.set_yticklabels(["CPU phase"] + [f"GPU stream {i}" for i in range(lanes[mode])],
