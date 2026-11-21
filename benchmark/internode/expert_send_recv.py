@@ -11,12 +11,12 @@ expert in bf16. Experts are sent as one flat buffer.
 
 Usage:
     # intra-node: 2 GPUs on one node
-    srun -N 1 --ntasks-per-node=2 python -u benchmark/expert_send_recv.py --intra-node
+    srun -N 1 --ntasks-per-node=2 python -u benchmark/internode/expert_send_recv.py --intra-node
     or
-    srun -N 1 -w "$MASTER_ADDR" --ntasks-per-node=2 --gpus=4 python -u benchmark/expert_send_recv.py --intra-node
+    srun -N 1 -w "$MASTER_ADDR" --ntasks-per-node=2 --gpus=4 python -u benchmark/internode/expert_send_recv.py --intra-node
 
     # inter-node: 1 GPU on each of two nodes
-    srun -N 2 --ntasks-per-node=1 python -u benchmark/expert_send_recv.py --inter-node
+    srun -N 2 --ntasks-per-node=1 python -u benchmark/internode/expert_send_recv.py --inter-node
 """
 import argparse
 import socket
@@ -24,7 +24,7 @@ import socket
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import init_dist
+from benchmark.utils import init_dist, time_ms
 
 
 def check_placement(inter_node: bool) -> list[str]:
@@ -33,7 +33,7 @@ def check_placement(inter_node: bool) -> list[str]:
     Assumes exactly 2 ranks.
 
     Returns:
-        Hostnames of rank 0 and rank 1.
+        hosts: hostnames of rank 0 and rank 1.
     """
     world = dist.get_world_size()
     if world != 2:
@@ -65,28 +65,15 @@ def benchmark(
     numel = n * 3 * args.hidden * args.intermediate
     buf = torch.randn(numel, device=device, dtype=dtype)
 
-    for _ in range(args.warmup):
+    def transfer() -> None:
+        """Send on rank 0, receive on rank 1."""
         if rank == 0:
             dist.send(buf, dst=1)
         else:
             dist.recv(buf, src=0)
 
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-
-    for start, end in zip(starts, ends):
-        dist.barrier()
-        start.record()
-        if rank == 0:
-            dist.send(buf, dst=1)
-        else:
-            dist.recv(buf, src=0)
-        end.record()
-    torch.cuda.synchronize()
-
-    ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
-    dist.all_reduce(ms, op=dist.ReduceOp.MAX)
-    return buf.numel() * buf.element_size(), ms.tolist()
+    times = time_ms(transfer, args.warmup, args.iterations)
+    return buf.numel() * buf.element_size(), times
 
 
 def main(args: argparse.Namespace) -> None:

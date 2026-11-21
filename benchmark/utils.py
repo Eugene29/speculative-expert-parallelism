@@ -29,8 +29,8 @@ def init_dist() -> tuple[int, int, torch.device]:
     return rank, world, device
 
 
-def check_node_layout(gpus_per_node: int) -> list[str]:
-    """Check ranks fill at least 2 nodes in blocks of gpus_per_node.
+def check_node_layout(gpus_per_node: int, min_nodes: int = 2) -> list[str]:
+    """Check ranks fill at least min_nodes nodes in blocks of gpus_per_node.
 
     Block order (ranks 0-3 on node 0, 4-7 on node 1, ...) is what makes
     rank + gpus_per_node the same local rank on a different node.
@@ -43,8 +43,9 @@ def check_node_layout(gpus_per_node: int) -> list[str]:
         raise RuntimeError(f"{world} ranks is not a multiple of {gpus_per_node} per node.")
 
     num_nodes = world // gpus_per_node
-    if num_nodes < 2:
-        raise RuntimeError(f"Expected at least 2 nodes, got {num_nodes}. Use srun -N 2 or more.")
+    if num_nodes < min_nodes:
+        raise RuntimeError(f"Expected at least {min_nodes} nodes, got {num_nodes}. "
+                           f"Use srun -N {min_nodes} or more.")
 
     hosts = [None] * world
     dist.all_gather_object(hosts, socket.gethostname())
@@ -65,9 +66,10 @@ def load_routing(
     """Load this rank's share of one layer's recorded routing.
 
     run_dir/experts_rank{r}.pt holds a [num_layers, num_tokens, k] tensor of expert
-    ids for recorded rank r, written by scripts/ds_moe.py. With more ranks than
+    ids for recorded rank r, written by scripts/ds_moe.py --record. With more ranks than
     recordings, each recording's tokens are split across world // recordings ranks, in
-    rank order, so the global workload stays the same.
+    rank order. With fewer, each rank replays recordings // world recordings back to
+    back. Either way the global workload stays the same.
 
     Returns:
         route: [num_tokens, k] expert ids of this rank's tokens, as int64.
@@ -75,13 +77,17 @@ def load_routing(
     recorded = sum(
         f.startswith("experts_rank") and f.endswith(".pt") for f in os.listdir(run_dir)
     )
-    if recorded == 0 or world % recorded != 0:
-        raise RuntimeError(f"{world} ranks is not a multiple of {recorded} recordings "
-                           f"in {run_dir}.")
+    if recorded == 0 or (world % recorded != 0 and recorded % world != 0):
+        raise RuntimeError(f"{world} ranks and {recorded} recordings in {run_dir} "
+                           f"don't divide each other.")
 
-    shards = world // recorded
-    route = torch.load(f"{run_dir}/experts_rank{rank // shards}.pt", map_location="cpu")
-    route = route[layer].tensor_split(shards)[rank % shards].long()
+    shards, merged = max(world // recorded, 1), max(recorded // world, 1)
+    first = rank // shards * merged
+    route = torch.cat([
+        torch.load(f"{run_dir}/experts_rank{r}.pt", map_location="cpu")[layer]
+        for r in range(first, first + merged)
+    ])
+    route = route.tensor_split(shards)[rank % shards].long()
 
     if route.numel() > 0 and (route.min() < 0 or route.max() >= num_experts):
         raise RuntimeError(f"Recorded expert ids span {route.min()}..{route.max()}, "
@@ -113,16 +119,17 @@ def make_inputs(
 
 
 def time_ms(
-    fn: Callable[[], torch.Tensor],
+    fn: Callable[[], object],
     warmup: int,
     iterations: int,
-) -> float:
-    """Time fn on every rank and report the slowest rank's average. Collective.
+) -> list[float]:
+    """Time fn on every rank and report each call's slowest rank. Collective.
 
-    Runs warmup untimed calls, then iterations timed ones.
+    Runs warmup untimed calls, then iterations timed ones. All ranks line up at a
+    barrier before each timed call.
 
     Returns:
-        ms: Average milliseconds per call on the slowest rank.
+        times: Milliseconds of each timed call on the rank that took longest for it.
     """
     # Warmup also builds the NCCL communicators each group creates on first use.
     for _ in range(warmup):
@@ -138,7 +145,9 @@ def time_ms(
         end.record()
     torch.cuda.synchronize()
 
-    avg = sum(s.elapsed_time(e) for s, e in zip(starts, ends)) / iterations
-    ms = torch.tensor(avg, device=torch.cuda.current_device())
-    dist.all_reduce(ms, op=dist.ReduceOp.MAX)
-    return ms.item()
+    times = torch.tensor(
+        [s.elapsed_time(e) for s, e in zip(starts, ends)],
+        device=torch.cuda.current_device(),
+    )
+    dist.all_reduce(times, op=dist.ReduceOp.MAX)
+    return times.tolist()

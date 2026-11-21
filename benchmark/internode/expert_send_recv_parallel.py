@@ -1,11 +1,11 @@
 """Benchmark of parallel send/recv of MoE expert weights in a ring across nodes.
 
 Each GPU sends N experts to the GPU with the same local rank on the next node
-and receives N experts from the previous node (node i -> i+1, last -> 0). With 
+and receives N experts from the previous node (node i -> i+1, last -> 0). With
 2 nodes the ring is a bidirectional swap between the two nodes.
 
-This measures whether concurrent transfers increase aggregate inter-node 
-communication or stays the same because inter-node network is shared. 
+This measures whether concurrent transfers raise the aggregate inter-node
+throughput, or leave it the same because the ranks share the network.
 
 The expert architecture assumes a gated FFNN (e.g. SwiGLU), as in
 Qwen3.6-35B-A3B: each expert holds gate and up projections [I, H] and a
@@ -26,7 +26,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import check_node_layout, init_dist
+from benchmark.utils import check_node_layout, init_dist, time_ms
 
 
 def get_ring_peers(rank: int, world: int, gpus_per_node: int) -> tuple[int, int]:
@@ -65,24 +65,13 @@ def benchmark(
         dist.P2POp(dist.irecv, recv_buf, prev_rank),
     ]
 
-    for _ in range(args.warmup):
+    def transfer() -> None:
+        """Send to next_rank, receive from prev_rank, and wait for both."""
         for req in dist.batch_isend_irecv(ops):
             req.wait()
 
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-
-    for start, end in zip(starts, ends):
-        dist.barrier()
-        start.record()
-        for req in dist.batch_isend_irecv(ops):
-            req.wait()
-        end.record()
-    torch.cuda.synchronize()
-
-    ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
-    dist.all_reduce(ms, op=dist.ReduceOp.MAX)
-    return send_buf.numel() * send_buf.element_size(), ms.tolist()
+    times = time_ms(transfer, args.warmup, args.iterations)
+    return send_buf.numel() * send_buf.element_size(), times
 
 
 def main(args: argparse.Namespace) -> None:

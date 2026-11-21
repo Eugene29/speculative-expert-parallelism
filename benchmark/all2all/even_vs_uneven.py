@@ -1,16 +1,20 @@
-"""Benchmark of all2all in uneven (real workload) and even workload.
+"""Benchmark one all2all with the recorded uneven split sizes against even ones.
 
-Loads the recording of [token, experts] and mimics all2all.
+Replays one layer of recorded routing as a single all2all: one row per (token,
+expert) pair, sent to the expert's rank. The even run sends the same number of rows
+from each rank, split equally across the ranks. Row values are random, so only the
+split sizes come from the recording.
 
-srun --ntasks-per-node=4 \
-  python -u benchmark/all2all/even_vs_uneven.py logs/2026-10-16_14-07-50 0
+Usage:
+    srun -N 2 --ntasks-per-node=4 \
+        python -u benchmark/all2all/even_vs_uneven.py logs/2026_oct/2026-10-16_14-07-50 0
 """
 import sys
-import numpy as np
+
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import init_dist
+from benchmark.utils import init_dist, load_routing, time_ms
 
 E, H = 256, 2048
 WARMUP = 3
@@ -18,52 +22,34 @@ ITERATIONS = 5
 SCALE = 1
 
 
-def get_send_recv_splits(ids, E, rank, world, device, scale=SCALE):
-    send = torch.bincount(
-        ids.long().flatten().to(device) // (E // world),
-        minlength=world,
-    )
-    counts = [torch.empty_like(send) for _ in range(world)]
-    dist.all_gather(counts, send)
-    counts = torch.stack(counts).cpu() * scale
+def recorded_splits(route: torch.Tensor, world: int) -> tuple[list[int], list[int]]:
+    """Count the rows this rank exchanges with each rank under the recorded routing.
 
-    send_splits = counts[rank].tolist()
-    recv_splits = counts[:, rank].tolist()
-    return send_splits, recv_splits
+    Collective. Expert e lives on rank e // (E // world).
+
+    Returns:
+        send: rows sent to each rank.
+        recv: rows received from each rank.
+    """
+    send = torch.bincount(route.flatten() // (E // world), minlength=world) * SCALE
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send)
+    return send.tolist(), recv.tolist()
 
 
-def benchmark(name, send_splits, recv_splits):
+def benchmark(name: str, send: list[int], recv: list[int], device: torch.device) -> None:
+    """Time one all2all with the given split sizes and print its throughput. Collective."""
     rank, world = dist.get_rank(), dist.get_world_size()
-    device = torch.device("cuda", torch.cuda.current_device())
-
-    x = torch.randn(sum(send_splits), H, device=device, dtype=torch.bfloat16)
-    y = torch.empty(sum(recv_splits), H, device=device, dtype=x.dtype)
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    for _ in range(WARMUP):
-        dist.all_to_all_single(y, x, recv_splits, send_splits)
-
-    dist.barrier()
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(ITERATIONS):
-        dist.all_to_all_single(y, x, recv_splits, send_splits)
-    end.record()
-    end.synchronize()
-
-    row_bytes = H * x.element_size()
-    sent = (sum(send_splits) - send_splits[rank]) * row_bytes
-    total = sent * world
-    ms = torch.tensor(start.elapsed_time(end) / ITERATIONS, device=device)
-    dist.all_reduce(ms, op=dist.ReduceOp.MAX)
+    x = torch.randn(sum(send), H, device=device, dtype=torch.bfloat16)
+    y = torch.empty(sum(recv), H, device=device, dtype=x.dtype)
+    times = time_ms(lambda: dist.all_to_all_single(y, x, recv, send), WARMUP, ITERATIONS)
+    ms = sum(times) / len(times)
 
     if rank == 0:
-        seconds = ms.item() / 1000
-        agg_gbs = total / seconds / 1e9
+        total = (sum(send) - send[rank]) * H * x.element_size() * world
+        agg_gbs = total / (ms / 1000) / 1e9
         print(
-            f"{name}: {ms.item():.3f} ms | "
+            f"{name}: {ms:.3f} ms | "
             f"{total / 2**20:.1f} MiB off-rank | "
             f"{agg_gbs:.2f} GB/s aggregate | "
             f"{agg_gbs / world:.2f} GB/s per GPU"
@@ -71,18 +57,13 @@ def benchmark(name, send_splits, recv_splits):
 
 
 if __name__ == "__main__":
-    run_dir = sys.argv[1]
-    layer = int(sys.argv[2])
-
+    run_dir, layer = sys.argv[1], int(sys.argv[2])
     rank, world, device = init_dist()
 
-    ids = torch.load(f"{run_dir}/experts_rank{rank}.pt", map_location="cpu")[layer]
-    tokens, top_k = ids.shape
+    route = load_routing(run_dir, layer, rank, world, E).to(device)
+    benchmark("uneven", *recorded_splits(route, world), device)
 
-    send_splits, recv_splits = get_send_recv_splits(ids, E, rank, world, device)
-    benchmark("uneven", send_splits, recv_splits)
-
-    balanced = [tokens * top_k * SCALE // world] * world
-    benchmark("even", balanced, balanced)
+    even = [route.numel() * SCALE // world] * world
+    benchmark("even", even, even, device)
 
     dist.destroy_process_group()

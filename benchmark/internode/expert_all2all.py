@@ -7,9 +7,9 @@ worth of bytes as the ring in expert_send_recv_parallel.py, so the two are
 directly comparable. With 2 nodes the all-to-all is the same bidirectional
 swap as the ring.
 
-With --balance uneven, we can test whether uneven all2all can be slower 
-than even all2all in internode setting. There are two uneven balance modes: 
-intra-node or inter-node imbalance.
+--balance tests whether an uneven all2all is slower than an even one between
+nodes. The load is uneven either across nodes (uneven_internode) or across the
+GPUs of every node (uneven_intranode).
 
 The expert architecture assumes a gated FFNN (e.g. SwiGLU), as in
 Qwen3.6-35B-A3B: each expert holds gate and up projections [I, H] and a
@@ -34,7 +34,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from benchmark.utils import check_node_layout, init_dist
+from benchmark.utils import check_node_layout, init_dist, time_ms
 
 
 def get_splits(
@@ -58,46 +58,31 @@ def get_splits(
     world = dist.get_world_size()
     num_nodes = world // gpus_per_node
     num_remote = world - gpus_per_node
-
-    my_node = rank // gpus_per_node
-    same_node = [r // gpus_per_node == my_node for r in range(world)]
+    ranks = range(world)
 
     if balance == "even":
-        if numel % num_remote != 0:
-            raise RuntimeError(f"{numel} elements don't split evenly across {num_remote} ranks.")
-        chunk = numel // num_remote
-        splits = [0 if same else chunk for same in same_node]
-        return splits, splits
+        load_delta, is_heavy = 0.0, [True] * world
+    elif balance == "uneven_internode":
+        if num_nodes % 2 != 0:
+            raise RuntimeError(f"uneven_internode needs an even number of nodes, got {num_nodes}.")
+        is_heavy = [r // gpus_per_node < num_nodes // 2 for r in ranks]
+    elif balance == "uneven_intranode":
+        if gpus_per_node % 2 != 0:
+            raise RuntimeError(f"uneven_intranode needs an even number of GPUs per node, "
+                               f"got {gpus_per_node}.")
+        is_heavy = [r % gpus_per_node < gpus_per_node // 2 for r in ranks]
 
     heavy_chunk = numel * (1 + load_delta) / num_remote
     light_chunk = numel * (1 - load_delta) / num_remote
     if heavy_chunk != int(heavy_chunk) or light_chunk != int(light_chunk):
         raise RuntimeError(f"numel={numel} with load_delta={load_delta} doesn't split "
                            f"evenly across {num_remote} ranks.")
-    heavy_chunk, light_chunk = int(heavy_chunk), int(light_chunk)
+    chunks = [int(heavy_chunk if heavy else light_chunk) for heavy in is_heavy]
 
-    if balance == "uneven_internode":
-        if num_nodes % 2 != 0:
-            raise RuntimeError(f"uneven_internode needs an even number of nodes, got {num_nodes}.")
-        is_heavy = [r // gpus_per_node < num_nodes // 2 for r in range(world)]
-        chunks = [heavy_chunk if heavy else light_chunk for heavy in is_heavy]
-        my_chunk = chunks[rank]
-        send_splits = [0 if same else my_chunk for same in same_node]
-        recv_splits = [0 if same else chunks[r] for r, same in enumerate(same_node)]
-        return send_splits, recv_splits
-
-    if balance == "uneven_intranode":
-        if gpus_per_node % 2 != 0:
-            raise RuntimeError(f"uneven_intranode needs an even number of GPUs per node, "
-                               f"got {gpus_per_node}.")
-        is_heavy = [r % gpus_per_node < gpus_per_node // 2 for r in range(world)]
-        chunks = [heavy_chunk if heavy else light_chunk for heavy in is_heavy]
-        my_chunk = chunks[rank]
-        send_splits = [0 if same else my_chunk for same in same_node]
-        recv_splits = [0 if same else chunks[r] for r, same in enumerate(same_node)]
-        return send_splits, recv_splits
-
-    raise ValueError(f"Unknown balance {balance}.")
+    other_node = [r // gpus_per_node != rank // gpus_per_node for r in ranks]
+    send_splits = [chunks[rank] if other else 0 for other in other_node]
+    recv_splits = [chunks[r] if other else 0 for r, other in enumerate(other_node)]
+    return send_splits, recv_splits
 
 
 def benchmark(
@@ -121,22 +106,12 @@ def benchmark(
     send_buf = torch.randn(sum(send_splits), device=device, dtype=dtype)
     recv_buf = torch.empty(sum(recv_splits), device=device, dtype=dtype)
 
-    for _ in range(args.warmup):
-        dist.all_to_all_single(recv_buf, send_buf, recv_splits, send_splits)
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
-
-    for start, end in zip(starts, ends):
-        dist.barrier()
-        start.record()
-        dist.all_to_all_single(recv_buf, send_buf, recv_splits, send_splits)
-        end.record()
-    torch.cuda.synchronize()
-
-    ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
-    dist.all_reduce(ms, op=dist.ReduceOp.MAX)
-    return numel * send_buf.element_size(), ms.tolist()
+    times = time_ms(
+        lambda: dist.all_to_all_single(recv_buf, send_buf, recv_splits, send_splits),
+        args.warmup,
+        args.iterations,
+    )
+    return numel * send_buf.element_size(), times
 
 
 def main(args: argparse.Namespace) -> None:

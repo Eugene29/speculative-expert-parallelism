@@ -1,11 +1,12 @@
 """Forward-only GEMM and Flash Attention benchmarks.
 
-Takes in hyper-parameters and computes the memory and TFLOPs of GEMM 
-and Flash Attention.
+Times one GEMM and one Flash Attention forward on a single GPU, with the sizes set
+by the constants below, and prints the TFLOP/s and peak memory of each.
 
 Usage:
     python benchmark/compute.py
 """
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -22,11 +23,15 @@ BATCH, HEADS, SEQ_LEN, HEAD_DIM = 8, 32, 4096, 64
 CAUSAL = True
 
 
-def benchmark(fn):
-    """Return (average GPU ms per forward pass, peak allocated MiB).
+def benchmark(fn: Callable[[], torch.Tensor]) -> tuple[float, float]:
+    """Time fn after WARMUP untimed calls and record its peak memory.
+
+    Returns:
+        ms: average GPU milliseconds per call over ITERATIONS calls.
+        peak_mib: peak allocated memory in MiB.
     """
     torch.cuda.reset_peak_memory_stats()
-    
+
     for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
@@ -39,14 +44,15 @@ def benchmark(fn):
         fn()
     end.record()
     end.synchronize()
-    
+
     peak = torch.cuda.max_memory_allocated()
 
     return start.elapsed_time(end) / ITERATIONS, peak / 2**20
 
 
 @torch.inference_mode()
-def main():
+def main() -> None:
+    """Benchmark the GEMM, then Flash Attention, and print one line for each."""
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
     print(f"GPU: {torch.cuda.get_device_name()} | dtype: {DTYPE}")
@@ -56,7 +62,7 @@ def main():
     out = torch.empty(H, H, device="cuda", dtype=DTYPE)
 
     gemm_ms, gemm_mem_mib = benchmark(lambda: torch.mm(a, b, out=out))
-    gemm_flops = 2 * H **2 * H2
+    gemm_flops = 2 * H**2 * H2
     gemm_tflops = gemm_flops / (gemm_ms / 1000) / 1e12
     print(
         f"GEMM: {gemm_ms:.3f} ms | {gemm_tflops:.2f} TFLOP/s | "
@@ -69,7 +75,7 @@ def main():
     k = torch.randn(shape, device="cuda", dtype=DTYPE)
     v = torch.randn(shape, device="cuda", dtype=DTYPE)
 
-    def attention():
+    def attention() -> torch.Tensor:
         return F.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=CAUSAL
         )
@@ -77,7 +83,7 @@ def main():
     # Force Flash Attention; fail if unsupported instead of falling back.
     with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
         attention_ms, attention_mem_mib = benchmark(attention)
-        
+
     pairs = SEQ_LEN * (SEQ_LEN + 1) // 2 if CAUSAL else SEQ_LEN**2
 
     attention_flops = 4 * BATCH * HEADS * pairs * HEAD_DIM
@@ -88,6 +94,7 @@ def main():
         f"{attention_tflops:.2f} TFLOP/s | "
         f"peak memory: {attention_mem_mib:.1f} MiB"
     )
+
 
 if __name__ == "__main__":
     main()
