@@ -48,10 +48,10 @@ its default capacity runs in 12.5 ms and drops 28% of the copies on layer 0.
 
 ## Checks still owed
 
-- [ ] Why RBD gets slower with hot replicas (Hot experts 01). Its transfers grow from
-  5.9 to 7.2 ms although fewer rows cross nodes.
-- [ ] Why the oracle hot set is slower than the static one on layer 20. The suspected
-  cause, replicas piling load onto single ranks, is not verified.
+- [ ] Why plain and RBD get slower with hot replicas while two-lane gets faster (Hot
+  experts 01). With 64 replicas per node plain sends 74% fewer rows between nodes and
+  saves under 1 ms, and RBD goes from 7.8 to 10.3 ms. The lead is the same as for
+  two-lane below: same-node rows over the communicator of all ranks.
 - [ ] Why offload and inter-node prefetch do not hide under a dispatch (Expert
   loading 01). The shared PCIe link is a guess.
 - [ ] Why two-lane beats one all2all: time same-node rows over the two-node group
