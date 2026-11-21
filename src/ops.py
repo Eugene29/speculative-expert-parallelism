@@ -1,12 +1,15 @@
-"""Operations shared by the plain and RBD dispatch: all2all and gather_sum.
+"""Operations shared by the dispatch algorithms: all2all, all2all_async and gather_sum.
 
-Neither knows which algorithm calls it. all2all moves rows between the ranks of a
-process group. gather_sum merges rows on one rank: a weighted sum of gathered rows,
-in a Triton kernel on GPU and in PyTorch ops on CPU.
+None knows which algorithm calls it. all2all moves rows between the ranks of a
+process group, and all2all_async does the same without waiting for them to arrive.
+gather_sum merges rows on one rank: a weighted sum of gathered rows, in a Triton
+kernel on GPU and in PyTorch ops on CPU.
 
 Usage:
-    from spec_ep.ops import all2all, gather_sum
+    from spec_ep.ops import all2all, all2all_async, gather_sum
 """
+from collections.abc import Callable
+
 import torch
 import torch.distributed as dist
 
@@ -16,7 +19,7 @@ try:
 except ImportError:
     triton = None
 
-__all__ = ["all2all", "gather_sum"]
+__all__ = ["all2all", "all2all_async", "gather_sum"]
 
 
 def all2all(
@@ -42,6 +45,32 @@ def all2all(
         out = rows.new_empty((sum(recv), *rows.shape[1:]))
     dist.all_to_all_single(out, rows, recv, send, group=group)
     return out
+
+
+def all2all_async(
+    rows: torch.Tensor,
+    send: list[int],
+    recv: list[int],
+    group: dist.ProcessGroup | None = None,
+    out: torch.Tensor | None = None,
+) -> Callable[[], torch.Tensor]:
+    """Start an all2all and return before the rows have arrived. Collective over group.
+
+    Takes the arguments of all2all. Calls on one group run in the order they were
+    started, so work on another group, or on this rank, overlaps with the transfer.
+
+    Returns:
+        wait: Blocks until the rows have arrived, then returns out as all2all does.
+    """
+    if out is None:
+        out = rows.new_empty((sum(recv), *rows.shape[1:]))
+    work = dist.all_to_all_single(out, rows, recv, send, group=group, async_op=True)
+
+    def wait() -> torch.Tensor:
+        work.wait()
+        return out
+
+    return wait
 
 
 if triton is not None:
