@@ -72,9 +72,15 @@ if wants record && [ -f "$REC/experts_rank59.pt" ]; then
       "$RUN/experts_rank0.pt" > "$OUT/record_check.out" 2>&1 <<'PYEOF'
 import sys
 import torch
-new, old = (torch.load(path).long().sort(-1).values for path in sys.argv[1:])
-same = (new == old).all(-1).float().mean().item()
-print(f"tokens whose 8 experts match the DeepSpeed recording, over all layers: {same:.4%}")
+new, old = (torch.load(path).long() for path in sys.argv[1:])
+chosen = [torch.zeros(*r.shape[:2], 256, dtype=torch.bool).scatter_(-1, r, True) for r in (new, old)]
+shared = (chosen[0] & chosen[1]).sum(-1) / 8.0
+print(f"copies that match the DeepSpeed recording, over all layers: {shared.mean():.2%}")
+print(f"  by layer, every 4th: {[round(shared[l].mean().item(), 3) for l in range(0, 40, 4)]}")
+print(f"tokens whose 8 experts all match: {(shared == 1).float().mean():.2%}")
+hot = [c.sum(1).topk(32).indices for c in chosen]
+overlap = sum(len(set(a.tolist()) & set(b.tolist())) for a, b in zip(*hot)) / hot[0].numel()
+print(f"32 busiest experts per layer that match: {overlap:.2%}")
 PYEOF
 fi
 

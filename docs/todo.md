@@ -55,14 +55,15 @@ its default capacity runs in 12.5 ms and drops 28% of the copies on layer 0.
 - [ ] Why offload and inter-node prefetch do not hide under a dispatch (Expert
   loading 01). The shared PCIe link is a guess.
 - [ ] Why two-lane beats one all2all: time same-node rows over the two-node group
-  against the node's own group.
+  against the node's own group. A lead from Expert loading 01: a same-node send over
+  the communicator of all ranks runs at 23 GB/s, and over the node's own at 79 GB/s.
+  Plain, Tutel and DeepSpeed's MOELayer all send their same-node rows over the first.
 - [ ] Where the 8.7e-3 error against plain, the same for every mode, comes from.
 - [ ] Run the `flops` and `comm` profilers of `scripts/ds_moe.py` on a model.
 
 ## Small code items
 
 - [ ] `scripts/ds_utils.py` reads the environment when imported.
-- [ ] The comment in `time_ms` about warm-up building communicators may be out of date.
 
 ## Features to bring back
 
