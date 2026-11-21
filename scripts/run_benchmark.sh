@@ -31,7 +31,8 @@ echo Running benchmark...
 # Every mode but deepep. USE_NVRTC=1: Tutel compiles its kernels without forking nvcc.
 # USE_NVRTC=1 srun -N 2 --ntasks-per-node=4 python -u -m benchmark.all2all.combine_dispatch \
 #   logs/2026_oct/2026-10-16_14-07-50 0 --degree 2 \
-#   --modes plain plain_fused rbd two_lane plain_pipe rbd_pipe tutel tutel_pipe
+#   --modes plain plain_fused rbd two_lane plain_pipe rbd_pipe tutel:capacity_factor=1 \
+#           ds_moe:capacity_factor=1
 
 # DeepEP against plain. This DeepEP build needs every rank on one node, and -w keeps
 # rank 0 on MASTER_ADDR, where the other ranks look for it.

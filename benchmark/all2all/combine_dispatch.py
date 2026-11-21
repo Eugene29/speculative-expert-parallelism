@@ -4,7 +4,10 @@ Every mode takes the same tokens, routing and expert function. It dispatches the
 tokens to their experts' ranks, runs the experts, and combines the weighted outputs
 back on the source rank.
 
-Modes (--modes; plain always runs, since every mode is checked and reported against it):
+Modes (--modes; plain always runs, since every mode is checked and reported against it).
+A mode takes settings as name:key=value,key=value, the keyword arguments of its
+function, so one run can time a mode several times, as in tutel:capacity_factor=1
+tutel:capacity_factor=1,degree=2:
     plain: spec_ep.plain. One row per (token, expert) in a single all2all each way.
     plain_fused: plain with RBD's merge kernel (spec_ep.ops.gather_sum) in place of
         index_add_, which separates the gain from fewer inter-node rows from the gain
@@ -15,13 +18,19 @@ Modes (--modes; plain always runs, since every mode is checked and reported agai
         in two all2alls that run at the same time.
     plain_pipe, rbd_pipe: spec_ep.pipeline. plain and rbd on --degree slices of the
         tokens, so the experts of one slice run while the next is on the network.
-    tutel: Tutel. Every expert is padded to one capacity, the most rows any rank sends
-        to any expert, and the padded buffer goes in an all2all with equal splits.
-    tutel_pipe: Tutel's own pipelining, on --degree chunks of capacity (rounded up to
-        a multiple of --degree), sent with a NCCL communicator that Tutel builds on
-        first use.
+    tutel: Tutel. Every expert is padded to one capacity and the padded buffer goes in
+        an all2all with equal splits. capacity_factor=0 (default) pads to the most rows
+        any rank sends to any expert; capacity_factor=1, Tutel's own default, gives
+        every expert its even share and drops the copies past it. degree=N pipelines N
+        chunks of capacity with a NCCL communicator Tutel builds on first use.
+        local_size=G uses Tutel's 2D hierarchical all2all for G ranks per node.
+    ds_moe: DeepSpeed's MOELayer. The same padded buffer and capacity_factor as tutel,
+        filled and read by DeepSpeed's own encode and decode.
     deepep: DeepEP. One row per (token, rank), through buffers shared by the GPUs of
-        one node.
+        one node. num_sms, dispatch_chunk and combine_chunk are DeepEP's tuning knobs,
+        and fused=True sums the local expert outputs with RBD's merge kernel.
+
+A mode that drops copies is checked against plain run on the copies it keeps.
 
 Node layout: rbd, two_lane and rbd_pipe need at least two nodes, since RBD saves
 nothing on one. deepep needs every rank on one node. The other modes run on any
@@ -32,6 +41,11 @@ only holds a [num_layers, num_tokens, k] tensor of expert ids for recorded rank 
 LAYER picks one layer. Thus, hidden dimension and number of experts are
 hyper-parameters, set by flags and defaulting to Qwen3.6-35B-A3B. The recordings are
 split or joined to fit the ranks, so the global workload stays the same.
+
+--hot N replicates the N busiest experts on every node before anything runs, so their
+copies stay on the token's node (benchmark.utils.replicate_hot). --hot-from says who
+is busiest: node counts the tokens the node holds now, the best a dynamic loader could
+do, and a recording directory counts all its batches, a static choice made ahead.
 
 The script first runs every mode with an expert that scales each row by its expert id
 and checks its output against plain. It then times a full forward pass of every mode
@@ -74,29 +88,47 @@ Usage:
     USE_NVRTC=1 srun -N 2 --ntasks-per-node=4 \
         python -u -m benchmark.all2all.combine_dispatch \
         logs/2026_oct/2026-10-16_14-07-50 0 --degree 2 \
-        --modes plain plain_fused rbd two_lane plain_pipe rbd_pipe tutel tutel_pipe
+        --modes plain plain_fused rbd two_lane plain_pipe rbd_pipe \
+                tutel tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
+                ds_moe:capacity_factor=1
 
     # One node. -w keeps rank 0 on MASTER_ADDR, where the other ranks look for it.
     srun -N 1 -w "$MASTER_ADDR" --ntasks-per-node=4 \
         python -u -m benchmark.all2all.combine_dispatch \
-        logs/2026_oct/2026-10-16_14-07-50 0 --modes plain deepep
+        logs/2026_oct/2026-10-16_14-07-50 0 \
+        --modes plain deepep deepep:num_sms=64,fused=True
 
     srun -N 2 --ntasks-per-node=4 \
         python -u -m benchmark.all2all.combine_dispatch \
         logs/2026_oct/2026-10-16_14-07-50 0 --modes plain plain_pipe rbd rbd_pipe \
         --expert ffn [--intermediate 512] --trace $SCRATCH/traces
+
+    # The 32 busiest experts of another recording, replicated on every node.
+    srun -N 2 --ntasks-per-node=4 \
+        python -u -m benchmark.all2all.combine_dispatch \
+        logs/2026_oct/2026-10-16_14-07-50 0 --hot 32 --hot-from logs/other_recording
 """
 import argparse
+import ast
 import os
 import statistics
 from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
-from benchmark.utils import check_node_layout, init_dist, load_routing, make_inputs, time_ms
+from benchmark.utils import (
+    check_node_layout,
+    expert_counts,
+    init_dist,
+    load_routing,
+    make_inputs,
+    replicate_hot,
+    time_ms,
+)
 from spec_ep.pipeline import pipelined_plain_combine_dispatch, pipelined_rbd_combine_dispatch
 from spec_ep.plain import plain_combine_dispatch
 from spec_ep.rbd import PILOT_RULES, rbd_combine_dispatch
@@ -104,10 +136,32 @@ from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 MODES = (
     "plain", "plain_fused", "rbd", "two_lane", "plain_pipe", "rbd_pipe",
-    "tutel", "tutel_pipe", "deepep",
+    "tutel", "ds_moe", "deepep",
 )
 NEED_TWO_NODES = {"rbd", "two_lane", "rbd_pipe"}
-BASELINES = {"tutel", "tutel_pipe", "deepep"}
+BASELINES = {"tutel", "ds_moe", "deepep"}
+PADDED = {"tutel", "ds_moe"}
+
+
+def parse_mode(spec: str) -> tuple[str, dict[str, object]]:
+    """Split a mode given as name:key=value,key=value.
+
+    Returns:
+        name: One of MODES.
+        settings: Keyword arguments for the mode's function. Values are Python
+            literals where they parse as one (2, 0.5, True) and strings otherwise.
+    """
+    name, _, rest = spec.partition(":")
+    if name not in MODES:
+        raise ValueError(f"Unknown mode {name!r} in {spec!r}. Modes: {', '.join(MODES)}.")
+    settings = {}
+    for item in filter(None, rest.split(",")):
+        key, _, value = item.partition("=")
+        try:
+            settings[key] = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            settings[key] = value
+    return name, settings
 
 
 def inter_node_rows(
@@ -166,14 +220,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("run_dir", help="Directory holding experts_rank{r}.pt")
     parser.add_argument("layer", type=int, help="Layer whose routing to replay")
-    parser.add_argument("--modes", nargs="+", choices=MODES,
+    parser.add_argument("--modes", nargs="+", metavar="MODE[:KEY=VALUE,...]",
                         default=["plain", "plain_fused", "rbd", "two_lane"])
     parser.add_argument("--num-experts", type=int, default=256, help="E, total experts")
     parser.add_argument("--hidden", type=int, default=2048, help="H, token width")
     parser.add_argument("--gpus-per-node", type=int, default=4)
     parser.add_argument("--pilot", choices=PILOT_RULES, default="rail", help="RBD pilot rule")
     parser.add_argument("--degree", type=int, default=2,
-                        help="Slices of plain_pipe, rbd_pipe and tutel_pipe")
+                        help="Slices of plain_pipe and rbd_pipe")
+    parser.add_argument("--hot", type=int, default=0,
+                        help="Replicate this many of the busiest experts on every node")
+    parser.add_argument("--hot-from", default="node", metavar="node|DIR",
+                        help="Busiest on this node's tokens, or over a recording directory")
     parser.add_argument("--expert", choices=("identity", "ffn"), default="identity",
                         help="Expert of the timed runs")
     parser.add_argument("--intermediate", type=int, default=512, help="I, width inside ffn")
@@ -183,7 +241,9 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=1, help="Timed calls per round")
     args = parser.parse_args()
     E, G = args.num_experts, args.gpus_per_node
-    selected = {"plain", *args.modes}
+    specs = dict.fromkeys(["plain", *args.modes])
+    parsed = {spec: parse_mode(spec) for spec in specs}
+    selected = {name for name, _ in parsed.values()}
 
     rank, world, device = init_dist()
     hosts = check_node_layout(G, min_nodes=1)
@@ -199,45 +259,69 @@ if __name__ == "__main__":
     local_group, _ = dist.new_subgroups(group_size=G)
 
     route = load_routing(args.run_dir, args.layer, rank, world, E).to(device)
+    if args.hot:
+        if args.hot_from == "node":
+            counts = route.flatten().bincount(minlength=E)
+            dist.all_reduce(counts, group=local_group)
+        else:
+            counts = expert_counts(args.hot_from, E)[:, args.layer].sum(0).to(device)
+        hot = counts.topk(args.hot).indices
+        covered = counts[hot].sum() / counts.sum()
+        route, E = replicate_hot(route, hot, rank, world, E, G)
     tokens, weights = make_inputs(route, args.hidden, device, seed=rank)
-    modes = {
-        "plain": lambda expert: plain_combine_dispatch(tokens, weights, expert, route, E),
-        "plain_fused": lambda expert: plain_combine_dispatch(
-            tokens, weights, expert, route, E, fused_merge=True
+
+    run = {
+        "plain": lambda expert, **settings: plain_combine_dispatch(
+            tokens, weights, expert, route, E, **settings
         ),
-        "rbd": lambda expert: rbd_combine_dispatch(
-            tokens, weights, expert, route, E, G, local_group, pilot_rule=args.pilot
+        "plain_fused": lambda expert, **settings: plain_combine_dispatch(
+            tokens, weights, expert, route, E, fused_merge=True, **settings
         ),
-        "two_lane": lambda expert: two_lane_rbd_combine_dispatch(
-            tokens, weights, expert, route, E, G, local_group, pilot_rule=args.pilot
+        "rbd": lambda expert, **settings: rbd_combine_dispatch(
+            tokens, weights, expert, route, E, G, local_group,
+            **{"pilot_rule": args.pilot, **settings},
         ),
-        "plain_pipe": lambda expert: pipelined_plain_combine_dispatch(
-            tokens, weights, expert, route, E, args.degree
+        "two_lane": lambda expert, **settings: two_lane_rbd_combine_dispatch(
+            tokens, weights, expert, route, E, G, local_group,
+            **{"pilot_rule": args.pilot, **settings},
         ),
-        "rbd_pipe": lambda expert: pipelined_rbd_combine_dispatch(
-            tokens, weights, expert, route, E, G, local_group, args.degree,
-            pilot_rule=args.pilot,
+        "plain_pipe": lambda expert, **settings: pipelined_plain_combine_dispatch(
+            tokens, weights, expert, route, E, **{"degree": args.degree, **settings}
+        ),
+        "rbd_pipe": lambda expert, **settings: pipelined_rbd_combine_dispatch(
+            tokens, weights, expert, route, E, G, local_group,
+            **{"degree": args.degree, "pilot_rule": args.pilot, **settings},
         ),
     }
     if selected & BASELINES:
         from benchmark.all2all import baselines
 
-        modes["tutel"] = lambda expert: baselines.tutel_combine_dispatch(
-            tokens, weights, expert, route, E
+        run["tutel"] = lambda expert, **settings: baselines.tutel_combine_dispatch(
+            tokens, weights, expert, route, E, **settings
         )
-        modes["tutel_pipe"] = lambda expert: baselines.tutel_combine_dispatch(
-            tokens, weights, expert, route, E, overlap_degree=args.degree
+        run["ds_moe"] = lambda expert, **settings: baselines.ds_moe_combine_dispatch(
+            tokens, weights, expert, route, E, **settings
         )
     if "deepep" in selected:
-        buffer = baselines.make_deepep_buffer(dist.group.WORLD, args.hidden)
-        modes["deepep"] = lambda expert: baselines.deepep_combine_dispatch(
-            buffer, tokens, weights, expert, route, E
+        buffer = baselines.make_deepep_buffer(dist.group.WORLD)
+        run["deepep"] = lambda expert, **settings: baselines.deepep_combine_dispatch(
+            buffer, tokens, weights, expert, route, E, **settings
         )
-    modes = {name: mode for name, mode in modes.items() if name in selected}
+    modes = {spec: partial(run[name], **settings) for spec, (name, settings) in parsed.items()}
 
     plain_rows, rbd_rows, copies = inter_node_rows(route, E, G)
-    if selected & {"tutel", "tutel_pipe"}:
-        capacity = baselines.tutel_capacity(weights, route, E)
+    # capacity and kept copies of every padded mode; the other modes keep every copy.
+    padded = {
+        spec: baselines.capacity_kept(
+            weights, route, E, settings.get("capacity_factor", 0), settings.get("degree", 1)
+        )
+        for spec, (name, settings) in parsed.items() if name in PADDED
+    }
+    dropped = {}
+    for spec, (_, kept) in padded.items():
+        count = (~kept).sum()
+        dist.all_reduce(count)
+        dropped[spec] = count.item()
 
     if rank == 0:
         print(
@@ -253,23 +337,36 @@ if __name__ == "__main__":
             f"({plain_rows / max(rbd_rows, 1):.2f}x fewer)",
             flush=True,
         )
-        if selected & {"tutel", "tutel_pipe"}:
-            padded = world * E * capacity
+        if args.hot:
             print(
-                f"tutel rows per direction: capacity {capacity} per expert and rank, "
-                f"{padded} padded rows for {copies} copies ({padded / copies:.1f}x)",
+                f"hot: {args.hot} experts from {args.hot_from} replicated on every node, "
+                f"which hold {covered:.1%} of the copies they were counted on; E grows to {E}",
+                flush=True,
+            )
+        for spec, (capacity, _) in padded.items():
+            rows = world * E * capacity
+            print(
+                f"{spec} rows per direction: capacity {capacity} per expert and rank, "
+                f"{rows} padded rows for {copies} copies ({rows / copies:.1f}x), "
+                f"drops {dropped[spec]} copies ({dropped[spec] / copies:.1%})",
                 flush=True,
             )
 
     scale = lambda x, expert_ids: x * ((expert_ids + 1) / E).to(x.dtype).unsqueeze(-1)
     reference = modes["plain"](scale).float()
+    width = max(map(len, modes))
     for name, mode in modes.items():
         if name == "plain":
             continue
         if rank == 0:
-            print(f"checking {name:>11} against plain: ", end="", flush=True)
-        error = (mode(scale).float() - reference).abs().max()
-        error = error / reference.abs().max().clamp_min(1e-12)
+            print(f"checking {name:>{width}} against plain: ", end="", flush=True)
+        expected = reference
+        if dropped.get(name):
+            expected = plain_combine_dispatch(
+                tokens, weights * padded[name][1], scale, route, E
+            ).float()
+        error = (mode(scale).float() - expected).abs().max()
+        error = error / expected.abs().max().clamp_min(1e-12)
         dist.all_reduce(error, op=dist.ReduceOp.MAX)
         if not error <= 2e-2:
             raise RuntimeError(f"Mode {name} differs from plain by up to {error:.2e} "
@@ -290,7 +387,7 @@ if __name__ == "__main__":
         print(f"{args.repeats} rounds x {args.iterations} timed calls per mode:", flush=True)
         for name, ms in calls.items():
             print(
-                f"{name:>11}: median {medians[name]:8.3f} ms | min {min(ms):8.3f} | "
+                f"{name:>{width}}: median {medians[name]:8.3f} ms | min {min(ms):8.3f} | "
                 f"max {max(ms):8.3f} | {medians['plain'] / medians[name]:.2f}x vs plain",
                 flush=True,
             )
@@ -299,6 +396,8 @@ if __name__ == "__main__":
         os.makedirs(args.trace, exist_ok=True)
         for name, mode in modes.items():
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                # Ranks start their profilers at different times; line them up again.
+                dist.barrier()
                 mode(expert)
                 torch.cuda.synchronize()
             prof.export_chrome_trace(f"{args.trace}/{name}_rank{rank}.json")

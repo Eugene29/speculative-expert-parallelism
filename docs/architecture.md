@@ -44,17 +44,19 @@ Imports point one way: each layer imports only from the layers above it in this 
 | `src/ops.py` | Operations shared by the algorithms. | `all2all`, `all2all_async`, `gather_sum` |
 | `src/plain.py` | The plain reference. | `plain_combine_dispatch` |
 | `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `make_plan`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
-| `benchmark/utils.py` | Launch, recorded routing, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `make_inputs`, `time_ms` |
+| `benchmark/utils.py` | Launch, recorded routing, hot-expert replicas, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `expert_counts`, `replicate_hot`, `make_inputs`, `time_ms` |
 | `src/two_lane.py` | RBD with stage 1 in two lanes. | `two_lane_plan`, `two_lane_dispatch`, `two_lane_combine`, `two_lane_rbd_combine_dispatch` |
 | `src/pipeline.py` | RBD and plain on slices of the tokens. | `pipelined_rbd_combine_dispatch`, `pipelined_plain_combine_dispatch` |
 | `benchmark/all2all/combine_dispatch.py` | Every version above, Tutel and DeepEP, against plain on recorded routing. | |
-| `benchmark/all2all/baselines.py` | Tutel and DeepEP behind the arguments of `plain_combine_dispatch`. | `tutel_combine_dispatch`, `tutel_capacity`, `make_deepep_buffer`, `deepep_combine_dispatch` |
+| `benchmark/all2all/baselines.py` | Tutel, DeepSpeed's MOELayer and DeepEP behind the arguments of `plain_combine_dispatch`, with each library's settings as keyword arguments. | `tutel_combine_dispatch`, `ds_moe_combine_dispatch`, `capacity_kept`, `make_deepep_buffer`, `deepep_combine_dispatch` |
+| `benchmark/hot_experts.py` | How stable the hot experts are across batches of recorded routing. | |
+| `benchmark/trace_report.py` | GPU time by kind and a timeline picture from `combine_dispatch --trace`. | |
 | `benchmark/all2all/even_vs_uneven.py` | One all2all with the recorded uneven split sizes against even split sizes. | |
-| `benchmark/internode/` | Send, receive and all2all of expert weights within and between nodes. | |
+| `benchmark/internode/` | Send, receive and all2all of expert weights within and between nodes, and loading them from host memory (`expert_load.py`). | |
 | `benchmark/compute.py` | GEMM and Flash Attention compute, no communication. | |
 | `tests/checks.py` | The check the tests share: layouts, routings and the locally computed answer, on CPU. | `LAYOUTS`, `Layout`, `run_check` |
 | `tests/test_rbd.py`, `tests/test_two_lane.py`, `tests/test_pipeline.py` | RBD, two-lane and the pipeline through that check, for every pilot rule. | |
-| `scripts/`, `configs/` | Model-level runs through DeepSpeed, including the routing recorder (`scripts/ds_moe.py --record`). Its helpers are in `scripts/ds_utils.py`. | |
+| `scripts/`, `configs/` | Model-level runs through DeepSpeed, including the routing recorder (`scripts/ds_moe.py --record`). Its helpers are in `scripts/ds_utils.py`. `scripts/record_routing.py` records routing on many batches with Hugging Face, and `scripts/jobs/` holds the job scripts behind the experiment pages. | |
 
 ## Naming rules
 

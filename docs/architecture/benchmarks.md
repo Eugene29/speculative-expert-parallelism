@@ -7,18 +7,27 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 
 | Script | What it measures |
 |---|---|
-| `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD, two-lane and the pipelines, with Tutel and DeepEP as baselines. |
+| `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD, two-lane and the pipelines, with Tutel, DeepSpeed's MOELayer and DeepEP as baselines. Also the same versions with the hot experts replicated on every node. |
+| `benchmark/hot_experts.py` | How stable the hot experts are from batch to batch, on recorded routing. CPU only. |
+| `benchmark/trace_report.py` | Where the GPU time of a `combine_dispatch --trace` run went, as a table and a timeline picture. CPU only. |
 | `benchmark/all2all/even_vs_uneven.py` | One all2all with the recorded (uneven) split sizes against even ones. |
 | `benchmark/internode/expert_all2all.py` | All2all of expert weights across nodes. |
 | `benchmark/internode/expert_send_recv.py` | Send/recv of expert weights between two ranks, within a node or between nodes. |
 | `benchmark/internode/expert_send_recv_parallel.py` | The same transfers in parallel, as a ring across nodes. |
+| `benchmark/internode/expert_load.py` | Loading expert weights onto every GPU at once from host memory, from the same node or from another node, alone and during an all2all. |
 | `benchmark/compute.py` | GEMM and Flash Attention compute, no communication. |
 
 ## How `combine_dispatch` runs
 
 `--modes` picks the versions: `plain`, `plain_fused`, `rbd`, `two_lane`, `plain_pipe`,
-`rbd_pipe`, `tutel`, `tutel_pipe` and `deepep`. `plain` always runs. The Tutel and
-DeepEP adapters are in `benchmark/all2all/baselines.py`, imported only when selected.
+`rbd_pipe`, `tutel`, `ds_moe` and `deepep`. `plain` always runs. The Tutel, DeepSpeed
+and DeepEP adapters are in `benchmark/all2all/baselines.py`, imported only when
+selected.
+
+A mode takes settings as `name:key=value,key=value`, which become keyword arguments of
+its function. One run can therefore time a mode under several settings, such as
+`tutel tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2`. The baselines'
+settings are listed in `baselines.py`.
 
 1. **Record.** A model run (`scripts/ds_moe.py --record`) saves which experts every token
    chose: one file per recorded rank, `experts_rank{r}.pt`, holding a
@@ -28,11 +37,16 @@ DeepEP adapters are in `benchmark/all2all/baselines.py`, imported only when sele
    two nodes or more, and `deepep` needs every rank on one.
 3. **Inputs.** `load_routing` gives this rank its share of one layer's recording, and
    `make_inputs` adds random tokens and weights. The routing is the only real data;
-   token values do not affect communication cost.
+   token values do not affect communication cost. With `--hot N`, `replicate_hot`
+   first reroutes the copies of the N busiest experts to replicas on the token's own
+   node. `--hot-from node` picks the busiest on the tokens the node holds, and
+   `--hot-from DIR` picks them from another recording.
 4. **Count.** `inter_node_rows` counts the rows plain and RBD send between nodes.
 5. **Check.** Every mode runs once with an expert that scales each row by its
    expert id, and its output is compared with plain. A row sent to the wrong expert,
-   merged into the wrong token or given the wrong weight changes the output.
+   merged into the wrong token or given the wrong weight changes the output. A padded
+   mode with a capacity limit drops copies, so it is compared with plain run on the
+   copies it keeps, and the script prints how many it drops.
 6. **Time.** `time_ms` times every mode with identity experts, so only communication
    and each mode's own planning are measured. The script runs `--repeats` rounds and
    times every mode in turn in each, so drift over the run favors none. All ranks line
@@ -41,7 +55,8 @@ DeepEP adapters are in `benchmark/all2all/baselines.py`, imported only when sele
    `--expert ffn` times with a real feed-forward expert instead, which is the GPU work
    the pipelined modes overlap with the network.
 7. **Trace.** With `--trace DIR`, every mode runs once more under `torch.profiler`
-   and every rank writes `DIR/{mode}_rank{r}.json`.
+   and every rank writes `DIR/{mode}_rank{r}.json`. `benchmark/trace_report.py DIR`
+   turns those into a table of GPU time and a picture.
 
 The recordings are split across ranks, or joined, to fit the number of ranks, so the
 total workload stays the same.
