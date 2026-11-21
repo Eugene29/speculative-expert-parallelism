@@ -1,7 +1,7 @@
 """Plot a histogram of expert popularity across experts and GPUs.
 
 Reads one or more `experts_rank{r}.pt` files written by
-`scripts/ds_moe.py::record_expert_routing`. Each file holds a tensor of shape
+`scripts/ds_moe.py --record`. Each file holds a tensor of shape
 [L, T, K]: for every MoE layer L and every token T on that rank, the ids of
 the top-K experts it was routed to. Files are concatenated along the token
 dim.
@@ -23,9 +23,9 @@ the first input file, with the same stem.
 
 Usage:
     python visualization/visualize_expert_routing.py logs/2026_oct/2026-10-16_14-07-50/experts_rank*.pt
-    
+
     python visualization/visualize_expert_routing.py $LOGS/experts_rank*.pt \\
-        --num_experts 256 --num_gpus 8 --row_h 1.8
+        --num_experts 256 --num_gpus 8
 """
 import argparse
 from pathlib import Path

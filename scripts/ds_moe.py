@@ -1,29 +1,70 @@
-"""Run MoE model with deepspeed's AutoEP
+"""Time DeepSpeed AutoEP inference of the MoE model, and optionally record its routing.
 
-Note:
-    Using Qwen3.6 35B-A3B
+Loads Qwen3.6-35B-A3B on CPU, lets DeepSpeed's AutoEP spread the experts over the
+ranks, and runs a prefill forward on --seq-len tokens per rank cut from
+data/short_text.txt. For every config it runs three timed forwards, then one more
+forward under each profiler named by --profile. With several configs the model is
+loaded once, only the AutoEP comm settings switch, and each config writes under
+LOGS/<config name>/ instead of LOGS/.
+
+The profilers:
+    torch (default): torch.profiler. Leaves profile/trace_rank{r}.json for every rank
+        and profile/key_averages.txt, the 30 ops with the most CUDA time on rank 0.
+    flops: DeepSpeed's flops profiler. Leaves flops_profile_{r}.txt, with flops,
+        MACs, parameters and latency per module.
+    comm: DeepSpeed's comms logger. Prints the count, message size, latency and
+        bandwidth of every communication op. The config must turn it on with
+        "comms_logger": {"enabled": true}.
+
+With --record it first saves the experts every token chose to
+LOGS/experts_rank{r}.pt, which the benchmarks replay.
+
+Usage:
+    # In a SLURM allocation. run_ds.sh sets up NCCL, LOGS and the python env, then runs
+    # srun --ntasks-per-node=4 python -u scripts/ds_moe.py --config-pth configs/qwen_ep4.json
+    bash scripts/run_ds.sh
+
+    # Another config, and record the routing.
+    CONFIG=configs/qwen_ep8.json RECORD=1 bash scripts/run_ds.sh
+
+    # All three profilers.
+    PROFILE="torch flops comm" bash scripts/run_ds.sh
 """
-
 import argparse
 import json
 import os
 import time
-import torch
-import deepspeed
-import deepspeed.comm as dist
-
-from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 from pathlib import Path
 
-from utils import print0, shutdown_comm, get_rank_and_world_size
-from utils_profile import AutoEPMoELayer, count_params, end_flops_profile, add_expert_statistics_hook, record_function, report_peak_mem, save_torch_profile, start_flops_profile, torch_profile_ctx
+import deepspeed
+import deepspeed.comm as dist
+import torch
+from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+from torch.profiler import record_function
+from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 
+from ds_utils import (
+    add_expert_statistics_hook,
+    count_params,
+    end_flops_profile,
+    print0,
+    rank,
+    report_peak_mem,
+    save_torch_profile,
+    shutdown_comm,
+    start_flops_profile,
+    torch_profile_ctx,
+)
 
-rank, world_size = get_rank_and_world_size()
 logs = Path(os.environ["LOGS"])
 
 
-def load_model(model_id):
+def load_model(model_id: str) -> Qwen3_5MoeForCausalLM:
+    """Load the text backbone on CPU and print its parameter counts.
+
+    Returns:
+        model: The model, not yet on any GPU.
+    """
     print0("Loading model and tokenizer...")
     model, loading_info = Qwen3_5MoeForCausalLM.from_pretrained(
         model_id,
@@ -45,8 +86,17 @@ def load_model(model_id):
             f"Missing model weights: {loading_info['missing_keys']}"
         )
     return model
-        
-def init_deepspeed(model, ds_config_pth):
+
+
+def init_deepspeed(
+    model: Qwen3_5MoeForCausalLM,
+    ds_config_pth: str,
+) -> deepspeed.DeepSpeedEngine:
+    """Wrap the model in a DeepSpeed engine, which applies AutoEP from the config.
+
+    Returns:
+        engine: The engine in eval mode.
+    """
     with open(ds_config_pth, 'r') as file:
         ds_config = json.load(file)
 
@@ -57,8 +107,8 @@ def init_deepspeed(model, ds_config_pth):
     )
     engine.eval()
     return engine
-    
-    
+
+
 def switch_comm(engine, ds_config_pth):
     """Switch every AutoEP layer to another config's communication settings.
 
@@ -76,12 +126,23 @@ def switch_comm(engine, ds_config_pth):
             layer._bind_rbd_node_group()
 
 
-def get_batch(model_id, dev, seq_len):
+def get_batch(
+    model_id: str,
+    dev: torch.device,
+    seq_len: int,
+) -> dict[str, torch.Tensor]:
+    """Cut this rank's seq_len tokens from data/short_text.txt.
+
+    Rank r gets tokens r * seq_len to (r + 1) * seq_len, so no two ranks share any.
+
+    Returns:
+        batch: input_ids and attention_mask, each [1, seq_len].
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    
+
     text = Path("data/short_text.txt").read_text(encoding="utf-8")
     text = " ".join(text.split())
-    
+
     tokens = tokenizer(
         text,
         add_special_tokens=False,
@@ -89,7 +150,7 @@ def get_batch(model_id, dev, seq_len):
     )
 
     strt, end = rank*seq_len, (rank+1)*seq_len
-    
+
     if tokens.input_ids[:, strt:end].shape[1] < seq_len:
         raise ValueError(f"Provide more text: at least {seq_len} tokens are required. "
                          f"[{rank}] has {tokens.input_ids[:, strt:end].shape[1]} seq.")
@@ -98,21 +159,32 @@ def get_batch(model_id, dev, seq_len):
         "input_ids": tokens.input_ids[:, strt:end].to(dev),
         "attention_mask": tokens.attention_mask[:, strt:end].to(dev),
     }
-    
+
     return batch
 
-def record_expert_routing(engine, batch):
-    """Save expert routing statistics (tokens per expert)
-    
-    Q. What does it store? 
+
+def record_expert_routing(
+    engine: deepspeed.DeepSpeedEngine,
+    batch: dict[str, torch.Tensor],
+) -> None:
+    """Run one forward and save the experts every token on this rank chose.
+
+    Writes LOGS/experts_rank{r}.pt: one [num_layers, num_tokens, k] int16 tensor of
+    expert ids. The hooks come off afterwards, so later forwards are timed without them.
     """
     sent = {}
-    add_expert_statistics_hook(engine.module, sent)
+    handles = add_expert_statistics_hook(engine.module, sent)
     engine(**batch, use_cache=False)
+    for handle in handles:
+        handle.remove()
     torch.save(torch.stack(list(sent.values())), logs / f"experts_rank{rank}.pt")
 
-def record_latency(engine, batch):
-    """Purely times the latency"""
+
+def record_latency(
+    engine: deepspeed.DeepSpeedEngine,
+    batch: dict[str, torch.Tensor],
+) -> None:
+    """Time one forward between barriers and print this rank's seconds. Collective."""
     torch.cuda.synchronize(engine.device)
     dist.barrier()
     strt = time.time()
@@ -121,17 +193,54 @@ def record_latency(engine, batch):
     dist.barrier()
     dur = time.time() - strt
     print(f"[{rank}] dur: {dur}", flush=True)
-    
-def run_pytorch_profile(engine, batch, outdir=logs):
-    """Run pytorch profiler"""
+
+
+def run_pytorch_profile(
+    engine: deepspeed.DeepSpeedEngine,
+    batch: dict[str, torch.Tensor],
+    outdir: Path,
+) -> None:
+    """Run one forward under torch.profiler and save the trace under outdir/profile."""
     with torch_profile_ctx() as tprof:
         with record_function("forward"):
-            outputs = engine(**batch, use_cache=False)
+            engine(**batch, use_cache=False)
         torch.cuda.synchronize(engine.device)
     save_torch_profile(tprof, outdir=outdir, verbose=True)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+
+def run_ds_flops_profile(
+    engine: deepspeed.DeepSpeedEngine,
+    batch: dict[str, torch.Tensor],
+    outdir: Path,
+) -> None:
+    """Run one forward under DeepSpeed's flops profiler and save the table under outdir."""
+    prof = start_flops_profile(engine.module)
+    engine(**batch, use_cache=False)
+    torch.cuda.synchronize(engine.device)
+    end_flops_profile(prof, outdir)
+
+
+def run_ds_comm_profile(
+    engine: deepspeed.DeepSpeedEngine,
+    batch: dict[str, torch.Tensor],
+) -> None:
+    """Run one forward and print DeepSpeed's comms logger summary of it. Collective.
+
+    Prints nothing unless the config sets "comms_logger": {"enabled": true}.
+    """
+    dist.comms_logger.reset_data()
+    engine(**batch, use_cache=False)
+    torch.cuda.synchronize(engine.device)
+    dist.log_summary(show_straggler=True)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the command line, ignoring flags the DeepSpeed launcher adds.
+
+    Returns:
+        args: config_pth, model, seq_len, record and profile.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--config-pth", type=str, nargs="+", default=["configs/qwen_ep8.json"],
                         help="Path to the DeepSpeed config-pth (e.g. configs/qwen_ep4.json). With several, "
                              "the model is loaded once with the first and the others only switch the "
@@ -139,26 +248,18 @@ def parse_args():
     parser.add_argument("--model", type=str, default="/pscratch/sd/e/eku/spec_ep/models/Qwen3.6-35B-A3B",
                         help="Model directory; must be a qwen3_5_moe checkpoint")
     parser.add_argument("--seq-len", type=int, default=4096, help="Tokens per rank")
+    parser.add_argument("--record", action="store_true",
+                        help="Save the expert routing to LOGS/experts_rank{r}.pt before timing")
+    parser.add_argument("--profile", nargs="*", choices=["torch", "flops", "comm"],
+                        default=["torch"],
+                        help="Profilers to run after the timed forwards, one forward each")
     # deepspeed launcher may inject --local_rank; ignore unknown args
     args, _ = parser.parse_known_args()
     return args
 
-def run_ds_flops_profile(engine, batch):
-    """DeepSpeed Flops profiler"""
-    prof = start_flops_profile(engine)
-    engine(**batch, use_cache=False)
-    torch.cuda.synchronize(engine.device)
-    end_flops_profile(prof, outdir=logs)
 
-def run_ds_comm_profile(engine, batch):
-    """DeepSpeed comms logger: per-op count, msg size, latency, algbw/busbw."""
-    if hasattr(dist.comms_logger, "reset_data"):
-        dist.comms_logger.reset_data()
-    outputs = engine(**batch, use_cache=False)
-    torch.cuda.synchronize(engine.device)
-    dist.log_summary(show_straggler=True)   # collective; call on ALL ranks
-
-def main():
+def main() -> None:
+    """Load the model once, then time and profile a forward under every config."""
     args = parse_args()
     model_id, seq_len = args.model, args.seq_len
 
@@ -167,6 +268,9 @@ def main():
     batch = get_batch(model_id, engine.device, seq_len)
 
     with torch.inference_mode():
+        if args.record:
+            record_expert_routing(engine, batch)
+
         for config_pth in args.config_pth:
             outdir = logs
             if len(args.config_pth) > 1:
@@ -178,10 +282,16 @@ def main():
             record_latency(engine, batch)
             record_latency(engine, batch)
 
-            run_pytorch_profile(engine, batch, outdir)
+            if "torch" in args.profile:
+                run_pytorch_profile(engine, batch, outdir)
+            if "flops" in args.profile:
+                run_ds_flops_profile(engine, batch, outdir)
+            if "comm" in args.profile:
+                run_ds_comm_profile(engine, batch)
 
     report_peak_mem(engine.device)
     shutdown_comm()
+
 
 if __name__ == "__main__":
     main()
