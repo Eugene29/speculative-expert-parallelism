@@ -5,7 +5,7 @@ Usage:
 """
 import torch
 
-from benchmark.utils import replicate_hot
+from benchmark.utils import busiest_remote, replicate_hot
 
 WORLD, GPUS_PER_NODE, EXPERTS, TOP_K = 8, 4, 64, 4
 
@@ -29,6 +29,14 @@ def test_hot_copies_move_to_the_tokens_node_and_the_rest_stay() -> None:
         assert (_node(new, grown)[moved] == rank // GPUS_PER_NODE).all()
         assert (new // (grown // WORLD) == route // (EXPERTS // WORLD))[~moved].all()
         assert all(len(set(row)) == TOP_K for row in new.tolist())
+
+
+def test_busiest_remote_skips_the_nodes_own_experts() -> None:
+    """The pick is the busiest experts of the other node, even when the node's own are busier."""
+    counts = torch.arange(EXPERTS)
+    for rank, expected in ((0, [63, 62, 61]), (5, [31, 30, 29])):
+        hot = busiest_remote(counts, 3, rank, WORLD, GPUS_PER_NODE)
+        assert hot.tolist() == expected
 
 
 def test_each_hot_expert_gets_one_replica_per_node() -> None:

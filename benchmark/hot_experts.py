@@ -17,6 +17,10 @@ It also prints the churn of the previous-batch loader, the experts per layer it 
 to load for each new batch, and how far the hot set moves: the Jaccard overlap of
 consecutive hot sets. All numbers are means over layers and batches.
 
+Coverage ignores where experts live. On a real layout some of a hot expert's copies
+already start on its node, so replicas save fewer copies than coverage says;
+combine_dispatch --hot counts and times that.
+
 --group G pools G consecutive recordings into one batch, for example 4 for the
 tokens one node holds in the benchmarks.
 

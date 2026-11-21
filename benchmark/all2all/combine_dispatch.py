@@ -42,10 +42,11 @@ LAYER picks one layer. Thus, hidden dimension and number of experts are
 hyper-parameters, set by flags and defaulting to Qwen3.6-35B-A3B. The recordings are
 split or joined to fit the ranks, so the global workload stays the same.
 
---hot N replicates the N busiest experts on every node before anything runs, so their
-copies stay on the token's node (benchmark.utils.replicate_hot). --hot-from says who
-is busiest: node counts the tokens the node holds now, the best a dynamic loader could
-do, and a recording directory counts all its batches, a static choice made ahead.
+--hot N gives every node replicas of the N busiest experts it does not hold, before
+anything runs, so their copies stay on the token's node (benchmark.utils.replicate_hot).
+--hot-from says who is busiest: node counts the tokens the node holds now, the best a
+dynamic loader could do, and a recording directory counts all its batches, a static
+choice made ahead.
 
 The script first runs every mode with an expert that scales each row by its expert id
 and checks its output against plain. It then times a full forward pass of every mode
@@ -121,6 +122,7 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
 from benchmark.utils import (
+    busiest_remote,
     check_node_layout,
     expert_counts,
     init_dist,
@@ -216,6 +218,20 @@ def make_ffn(
     return ffn
 
 
+def trace_aligned_call(fn: Callable[[], object], path: str) -> None:
+    """Profile one call of fn and write its chrome trace to path. Collective.
+
+    Ranks start their profilers at different times, so a barrier inside the profile
+    lines them up before the call. Otherwise the first transfer of the trace would
+    include waiting for the slower ranks.
+    """
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        dist.barrier()
+        fn()
+        torch.cuda.synchronize()
+    prof.export_chrome_trace(path)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("run_dir", help="Directory holding experts_rank{r}.pt")
@@ -229,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument("--degree", type=int, default=2,
                         help="Slices of plain_pipe and rbd_pipe")
     parser.add_argument("--hot", type=int, default=0,
-                        help="Replicate this many of the busiest experts on every node")
+                        help="Replicas per node, of the busiest experts it does not hold")
     parser.add_argument("--hot-from", default="node", metavar="node|DIR",
                         help="Busiest on this node's tokens, or over a recording directory")
     parser.add_argument("--expert", choices=("identity", "ffn"), default="identity",
@@ -265,8 +281,9 @@ if __name__ == "__main__":
             dist.all_reduce(counts, group=local_group)
         else:
             counts = expert_counts(args.hot_from, E)[:, args.layer].sum(0).to(device)
-        hot = counts.topk(args.hot).indices
-        covered = counts[hot].sum() / counts.sum()
+        hot = busiest_remote(counts, args.hot, rank, world, G)
+        moved = torch.isin(route, hot).sum()
+        dist.all_reduce(moved)
         route, E = replicate_hot(route, hot, rank, world, E, G)
     tokens, weights = make_inputs(route, args.hidden, device, seed=rank)
 
@@ -310,18 +327,15 @@ if __name__ == "__main__":
     modes = {spec: partial(run[name], **settings) for spec, (name, settings) in parsed.items()}
 
     plain_rows, rbd_rows, copies = inter_node_rows(route, E, G)
-    # capacity and kept copies of every padded mode; the other modes keep every copy.
-    padded = {
-        spec: baselines.capacity_kept(
-            weights, route, E, settings.get("capacity_factor", 0), settings.get("degree", 1)
-        )
-        for spec, (name, settings) in parsed.items() if name in PADDED
-    }
-    dropped = {}
-    for spec, (_, kept) in padded.items():
-        count = (~kept).sum()
-        dist.all_reduce(count)
-        dropped[spec] = count.item()
+    capacity, kept, dropped = {}, {}, {}
+    for spec, (name, settings) in parsed.items():
+        if name in PADDED:
+            capacity[spec], kept[spec] = baselines.capacity_kept(
+                weights, route, E, settings.get("capacity_factor", 0), settings.get("degree", 1)
+            )
+            count = (~kept[spec]).sum()
+            dist.all_reduce(count)
+            dropped[spec] = count.item()
 
     if rank == 0:
         print(
@@ -339,14 +353,15 @@ if __name__ == "__main__":
         )
         if args.hot:
             print(
-                f"hot: {args.hot} experts from {args.hot_from} replicated on every node, "
-                f"which hold {covered:.1%} of the copies they were counted on; E grows to {E}",
+                f"hot: every node gets {args.hot} replicas chosen from {args.hot_from}, "
+                f"which keep {moved.item() / copies:.1%} of all copies on their node; "
+                f"E grows to {E}",
                 flush=True,
             )
-        for spec, (capacity, _) in padded.items():
-            rows = world * E * capacity
+        for spec in capacity:
+            rows = world * E * capacity[spec]
             print(
-                f"{spec} rows per direction: capacity {capacity} per expert and rank, "
+                f"{spec} rows per direction: capacity {capacity[spec]} per expert and rank, "
                 f"{rows} padded rows for {copies} copies ({rows / copies:.1f}x), "
                 f"drops {dropped[spec]} copies ({dropped[spec] / copies:.1%})",
                 flush=True,
@@ -363,7 +378,7 @@ if __name__ == "__main__":
         expected = reference
         if dropped.get(name):
             expected = plain_combine_dispatch(
-                tokens, weights * padded[name][1], scale, route, E
+                tokens, weights * kept[name], scale, route, E
             ).float()
         error = (mode(scale).float() - expected).abs().max()
         error = error / expected.abs().max().clamp_min(1e-12)
@@ -395,12 +410,7 @@ if __name__ == "__main__":
     if args.trace:
         os.makedirs(args.trace, exist_ok=True)
         for name, mode in modes.items():
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                # Ranks start their profilers at different times; line them up again.
-                dist.barrier()
-                mode(expert)
-                torch.cuda.synchronize()
-            prof.export_chrome_trace(f"{args.trace}/{name}_rank{rank}.json")
+            trace_aligned_call(lambda: mode(expert), f"{args.trace}/{name}_rank{rank}.json")
         if rank == 0:
             print(f"traces: {args.trace}/{{mode}}_rank{{r}}.json", flush=True)
 

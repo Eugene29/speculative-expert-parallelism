@@ -2,7 +2,7 @@
 
 Usage:
     from benchmark.utils import init_dist, check_node_layout, load_routing, make_inputs, time_ms
-    from benchmark.utils import expert_counts, replicate_hot
+    from benchmark.utils import expert_counts, busiest_remote, replicate_hot
 """
 import os
 import socket
@@ -118,6 +118,32 @@ def expert_counts(run_dir: str, num_experts: int) -> torch.Tensor:
     return torch.stack(counts)
 
 
+def busiest_remote(
+    counts: torch.Tensor,
+    num_hot: int,
+    rank: int,
+    world: int,
+    gpus_per_node: int,
+) -> torch.Tensor:
+    """Pick the busiest experts that this rank's node does not hold.
+
+    A replica of an expert the node already holds would move no copy, so those
+    experts are never picked.
+
+    Args:
+        counts: [num_experts] copies routed to each expert, the same on every rank of
+            a node.
+
+    Returns:
+        hot: [num_hot] expert ids on other nodes, busiest first.
+    """
+    per_node = counts.numel() // world * gpus_per_node
+    node = rank // gpus_per_node
+    counts = counts.clone()
+    counts[node * per_node : (node + 1) * per_node] = -1
+    return counts.topk(num_hot).indices
+
+
 def replicate_hot(
     route: torch.Tensor,
     hot: torch.Tensor,
@@ -135,7 +161,8 @@ def replicate_hot(
 
     Args:
         route: [num_tokens, k] experts each token on this rank is routed to.
-        hot: [num_hot] expert ids to replicate, the same on every rank of a node.
+        hot: [num_hot] expert ids to replicate, the same on every rank of a node, as
+            busiest_remote() picks them.
 
     Returns:
         route: [num_tokens, k] routes in the grown numbering.
@@ -190,7 +217,6 @@ def time_ms(
     Returns:
         times: Milliseconds of each timed call on the rank that took longest for it.
     """
-    # Warmup also builds the NCCL communicators each group creates on first use.
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
