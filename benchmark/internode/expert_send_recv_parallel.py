@@ -55,7 +55,6 @@ def benchmark(
         nbytes: message size per rank in bytes.
         times: ms of each timed transfer, the slowest of all ranks.
     """
-    # Gated FFNN: gate [I, H] + up [I, H] + down [H, I].
     numel = n * 3 * args.hidden * args.intermediate
     send_buf = torch.randn(numel, device=device, dtype=dtype)
     recv_buf = torch.empty(numel, device=device, dtype=dtype)
@@ -74,7 +73,6 @@ def benchmark(
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
 
     for start, end in zip(starts, ends):
-        # Line all ranks up so every transfer in the ring starts together.
         dist.barrier()
         start.record()
         for req in dist.batch_isend_irecv(ops):
@@ -82,7 +80,6 @@ def benchmark(
         end.record()
     torch.cuda.synchronize()
 
-    # The ring is done only once every rank finishes; take the slowest rank.
     ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
     dist.all_reduce(ms, op=dist.ReduceOp.MAX)
     return send_buf.numel() * send_buf.element_size(), ms.tolist()

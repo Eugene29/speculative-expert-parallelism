@@ -67,7 +67,6 @@ if triton is not None:
         for j in tl.static_range(K):
             i = tl.load(index + row * K + j)
             w = tl.load(weight + row * K + j, mask=i >= 0, other=0.0)
-            # Padding slots (index -1) load nothing, so they never touch memory.
             x = tl.load(src + i * src_stride + cols, mask=in_row & (i >= 0), other=0.0)
             acc += w * x.to(tl.float32)
         dst = row
@@ -105,7 +104,6 @@ def gather_sum(
         out = src.new_empty((num_out, H))
 
     if triton is None or not src.is_cuda or src.dtype == torch.float64:
-        # Point empty slots at an appended zero row so every slot can be gathered.
         padded = torch.cat([src, src.new_zeros((1, H))])
         safe = torch.where(index >= 0, index, src.shape[0])
         sum_dtype = torch.promote_types(src.dtype, torch.float32)

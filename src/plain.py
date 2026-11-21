@@ -52,9 +52,7 @@ def plain_combine_dispatch(
     experts_per_rank = num_experts // world
     num_tokens, k = route.shape
 
-    # 1. Plan: tell each rank how many copies to expect, then which expert each is for.
     with record_function("plain/plan"):
-        # One copy per (token, expert), grouped by the rank holding the expert.
         copy_token = torch.arange(num_tokens, device=route.device).repeat_interleave(k)
         copy_expert = route.flatten()
         copy_rank = copy_expert // experts_per_rank
@@ -68,19 +66,15 @@ def plain_combine_dispatch(
         send, recv = send.tolist(), recv.tolist()
         expert_ids = all2all(copy_expert, send, recv, ep_group)
 
-    # 2. Dispatch: every copy travels on its own, even if another copy shares its node.
     with record_function("plain/dispatch"):
         inputs = all2all(tokens[copy_token], send, recv, ep_group)
 
-    # 3. Experts.
     with record_function("plain/experts"):
         outputs = expert(inputs, expert_ids)
 
-    # 4. Combine: reverse the dispatch, so rows return in the order of copy_token.
     with record_function("plain/combine"):
         returned = all2all(outputs, recv, send, ep_group)
 
-    # 5. Merge: weights are applied on the source rank, so they never cross the network.
     with record_function("plain/merge"):
         if fused_merge:
             position = torch.empty_like(order)

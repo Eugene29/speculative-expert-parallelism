@@ -104,8 +104,6 @@ def _select_pilot_rank(
     """
     G = gpus_per_node
     if pilot_rule == "even":
-        # Round-robin over the node's ranks in (source rank, token) order, starting
-        # where the lower source ranks left off.
         first = first_slot == torch.arange(expert_rank.shape[1], device=expert_rank.device)
         pilot_rank = expert_node * G
         for n in range(pilot_offset.numel()):
@@ -118,8 +116,6 @@ def _select_pilot_rank(
     elif pilot_rule == "first":
         pilot_rank = expert_rank.gather(1, first_slot)
     elif pilot_rule == "most":
-        # Score = copies held * G + a tie bonus below G that falls with cyclic
-        # distance after the rail rank, so the bonus never outweighs an extra copy.
         held = (expert_rank.unsqueeze(2) == expert_rank.unsqueeze(1)).sum(dim=2)
         after_rail = (expert_rank - rank) % G
         score = held * G + (G - 1 - after_rail)
@@ -224,15 +220,11 @@ def make_plan(
     device = route.device
     route = route.long()
 
-    # 1. Classify copies: each copy's rank and node, whether it is direct (on this
-    # node) and, if not, whether it is its node's pilot and which rank receives it.
     expert_rank = route // L
     expert_node = expert_rank // G
     local_expert = route % L
     direct = expert_node == node
 
-    # One route slot represents each (token, remote node), independently of which
-    # rank receives its pilot. same[t, j, i] groups slots by destination node.
     same = expert_node.unsqueeze(2) == expert_node.unsqueeze(1)
     pilot_slot = same.to(torch.uint8).argmax(dim=2)
     is_pilot = (pilot_slot == torch.arange(k, device=device)) & ~direct
@@ -243,10 +235,6 @@ def make_plan(
         expert_rank, expert_node, same, pilot_slot, rank, G, pilot_rule, pilot_offset
     )
 
-    # 2. Exchange counts. All counts are packed into one exchange so every split size
-    # can be read in one host sync. Each destination has direct expert counts, a pilot
-    # count, then stage 2 send counts by local rank and receive counts by (local rank,
-    # expert).
     pilot_column = L
     stage2_send_start = pilot_column + 1
     stage2_recv_start = stage2_send_start + G
@@ -266,7 +254,6 @@ def make_plan(
     slots = torch.cat([stage1.flatten(), to_pilot.flatten(), to_expert.flatten()])
     counts, recv_counts = _exchange_counts(slots, world, C, ep_group)
 
-    # 3. Read every split size in one host sync.
     stage2_in = recv_counts[:, stage2_recv_start:].view(world, G, L).sum(dim=0)
     sizes = torch.cat(
         [
@@ -282,22 +269,17 @@ def make_plan(
     pilot_send, pilot_recv = sizes[2 * world : 3 * world], sizes[3 * world : 4 * world]
     send2, recv2 = sizes[4 * world : 4 * world + G], sizes[4 * world + G :]
 
-    # 4. Order the stage 1 sends: by destination, then expert for direct rows. Copies
-    # that a pilot covers sort to the end and aren't sent.
     num_send1 = sum(send1)
     stage1_key = torch.where(stage1 < unused, stage1 // C * (L + 1) + stage1 % C, unused)
     order = stage1_key.flatten().sort(stable=True).indices
     sent = order[:num_send1]
 
-    # This node's ranks are contiguous, so its direct rows are one block of the send
-    # order and of the receive buffer, with pilots on either side.
     lo, hi = node * G, (node + 1) * G
     send_lo = sum(send1[:lo])
     send_hi = send_lo + sum(send1[lo:hi])
     recv_lo = sum(recv1[:lo])
     num_direct = sum(recv1[lo:hi])
 
-    # 5. Exchange pilot metadata: the experts each pilot stands for, and their weights.
     pilot_copy = torch.cat([sent[:send_lo], sent[send_hi:]])
     copy_expert, merge_weight = _send_pilot_meta(
         pilot_copy,
@@ -309,14 +291,10 @@ def make_plan(
         ep_group,
     )
 
-    # 6. Build the plan. Received pilots skip over the direct block in the stage 1
-    # buffer.
     num_pilots = sum(pilot_recv)
     pilot_row = torch.arange(num_pilots, device=device)
     pilot_row = pilot_row + num_direct * (pilot_row >= recv_lo)
 
-    # Stage 2 send order: by node-local expert, which sorts by destination and then
-    # by expert, as the receivers' counts expect. Empty slots sort to the end.
     num_send2 = sum(send2)
     stage2_key = torch.where(copy_expert >= 0, copy_expert, G * L).flatten()
     order2 = stage2_key.sort(stable=True).indices[:num_send2]
@@ -331,7 +309,6 @@ def make_plan(
         ]
     )
 
-    # Each copy's row in the returned stage 1 buffer, which keeps the send order.
     position = torch.empty_like(order)
     position[order] = torch.arange(order.numel(), device=device)
     position = position.view(num_tokens, k)
@@ -385,8 +362,6 @@ def stage2_dispatch(
         start, end = plan.direct
         num_direct = end - start
         expert_inputs = received.new_empty((num_direct + sum(plan.recv2), received.shape[1]))
-        # Stage 2 lands straight in its part of the input buffer. The direct rows
-        # are copied in on the compute stream while it runs.
         all2all(
             received[plan.send2_row],
             plan.send2,

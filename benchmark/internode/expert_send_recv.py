@@ -62,7 +62,6 @@ def benchmark(
         nbytes: message size in bytes.
         times: ms of each timed transfer, the slower of the two ranks.
     """
-    # Gated FFNN: gate [I, H] + up [I, H] + down [H, I].
     numel = n * 3 * args.hidden * args.intermediate
     buf = torch.randn(numel, device=device, dtype=dtype)
 
@@ -76,7 +75,6 @@ def benchmark(
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
 
     for start, end in zip(starts, ends):
-        # Line both ranks up so each transfer is timed on its own.
         dist.barrier()
         start.record()
         if rank == 0:
@@ -86,7 +84,6 @@ def benchmark(
         end.record()
     torch.cuda.synchronize()
 
-    # A transfer is done only once both sides finish; take the slower rank.
     ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
     dist.all_reduce(ms, op=dist.ReduceOp.MAX)
     return buf.numel() * buf.element_size(), ms.tolist()

@@ -41,7 +41,7 @@ ap.add_argument("--num_experts", type=int, default=256)
 ap.add_argument("--num_gpus", type=int, default=8)
 args = ap.parse_args()
 
-E = torch.cat([torch.load(f).long() for f in args.files], dim=1)   # [L, T_total, K]
+E = torch.cat([torch.load(f).long() for f in args.files], dim=1)
 L = E.shape[0]
 experts_per_gpu = args.num_experts // args.num_gpus
 
@@ -52,7 +52,7 @@ fig, axes = plt.subplots(
 col_titles = ["tokens per expert", "experts, sorted", "tokens per GPU", "GPUs, sorted"]
 
 for l in range(L):
-    ids = E[l].flatten()  # expert id per (token, pick)
+    ids = E[l].flatten()
     expert_hist = ids.bincount(minlength=args.num_experts)
     gpu_hist = (ids // experts_per_gpu).bincount(minlength=args.num_gpus)
 
@@ -65,11 +65,10 @@ for l in range(L):
     for c, (h, n, w) in enumerate(panels):
         ax = axes[l, c]
         ax.bar(range(n), h, width=w)
-        ax.axhline(h.float().mean(), color="red", lw=0.8, ls="--")   # perfectly balanced level
+        ax.axhline(h.float().mean(), color="red", lw=0.8, ls="--")
         ax.tick_params(labelsize=6)
         if c >= 2:
             ax.set_xticks(range(n))
-    # each histogram and its sorted twin share a y-range, so the skew is comparable
     for c0 in (0, 2):
         top = max(axes[l, c0].get_ylim()[1], axes[l, c0 + 1].get_ylim()[1])
         axes[l, c0].set_ylim(0, top)

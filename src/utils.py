@@ -14,7 +14,6 @@ def shutdown_comm():
         torch.distributed.destroy_process_group()
         
 def get_rank_and_world_size():
-    # Export env for srun launcher
     if "RANK" not in os.environ:
         os.environ["RANK"] = os.environ["SLURM_PROCID"]
         os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]

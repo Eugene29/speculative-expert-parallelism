@@ -21,7 +21,6 @@ def add_expert_statistics_hook(model, sent):
     """
     for i, layer in enumerate(m for m in model.modules() if isinstance(m, AutoEPMoELayer)):
         def hook(_m, _in, out, i=i, layer=layer):
-            # Q. What is the below two lines doing exactly? 
             sent[i] = out[1].to(torch.int16).cpu()
         layer.router.register_forward_hook(hook)
         
@@ -63,27 +62,7 @@ def save_torch_profile(prof, outdir, verbose=False):
     prof.export_chrome_trace(str(trace))
 
     events = prof.key_averages()
-    
-    # Below seems a lot lower than ds flops profiler
-    # total_flops = sum(e.flops for e in events)   # per-rank, from the profiled step
-    # print(f"rank {rank}: torch-profiler counted {total_flops/1e12:.2f} TFLOPs "
-    #       f"(aten ops only)", flush=True)
-          
+
     if verbose and (rank == 0):
         table = events.table(sort_by="cuda_time_total", row_limit=30)
         (outdir / "profile" / "key_averages.txt").write_text(table)
-        
-# def get_avg_flops_per_gpu(engine, batch):
-#     """Not supported after compiled"""
-#     # TODO: Fix the flops looking terrible. Too bad to be true.
-#     prof = FlopsProfiler(engine.module)      # run BEFORE engine.compile()
-#     prof.start_profile()
-#     with torch.inference_mode():
-#         engine(**batch, use_cache=False)
-#     prof.stop_profile()
-#     f = torch.tensor([float(prof.get_total_flops())], device=engine.device)
-#     prof.end_profile()
-#     tot = f.clone()
-#     dist.all_reduce(tot)
-#     print0(f"flops/GPU avg {tot.item()/world_size/1e12:.2f} T")
-#     return tot.item()

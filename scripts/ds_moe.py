@@ -38,9 +38,8 @@ def load_model(model_id):
            f"{(total-expert)/1e9:.2f}B dense)")
 
     assert model.config.model_type == "qwen3_5_moe_text"
-    model.config.use_cache = False  # Q. What is this? 
+    model.config.use_cache = False
 
-    # Do not benchmark with accidentally uninitialized text weights.
     if loading_info["missing_keys"]:
         raise RuntimeError(
             f"Missing model weights: {loading_info['missing_keys']}"
@@ -51,7 +50,6 @@ def init_deepspeed(model, ds_config_pth):
     with open(ds_config_pth, 'r') as file:
         ds_config = json.load(file)
 
-    # Then apply the AutoEP config from above.
     print0("Applying autoEP...")
     engine, _, _, _ = deepspeed.initialize(
         model=model,
@@ -115,7 +113,6 @@ def record_expert_routing(engine, batch):
 
 def record_latency(engine, batch):
     """Purely times the latency"""
-    # dist.barrier() # TODO: 
     torch.cuda.synchronize(engine.device)
     dist.barrier()
     strt = time.time()
@@ -124,8 +121,6 @@ def record_latency(engine, batch):
     dist.barrier()
     dur = time.time() - strt
     print(f"[{rank}] dur: {dur}", flush=True)
-    # TFlops_per_gpu = total_flop_count / dur / 1e12 / world_size
-    # print(f"[{rank}] real TFlops: {TFlops_per_gpu}", flush=True)
     
 def run_pytorch_profile(engine, batch, outdir=logs):
     """Run pytorch profiler"""
@@ -157,9 +152,8 @@ def run_ds_flops_profile(engine, batch):
 
 def run_ds_comm_profile(engine, batch):
     """DeepSpeed comms logger: per-op count, msg size, latency, algbw/busbw."""
-    # TODO: hangs at the end for some reason.
     if hasattr(dist.comms_logger, "reset_data"):
-        dist.comms_logger.reset_data()  # drop warmup/init comms
+        dist.comms_logger.reset_data()
     outputs = engine(**batch, use_cache=False)
     torch.cuda.synchronize(engine.device)
     dist.log_summary(show_straggler=True)   # collective; call on ALL ranks
@@ -180,24 +174,12 @@ def main():
                 outdir = logs / Path(config_pth).stem
                 (outdir / "profile").mkdir(parents=True, exist_ok=True)
                 print0(f"=== {config_pth}")
-            # compile + warmup
-            # print0("first")
-            # record_latency(engine, batch)
-            # engine.compile()
             record_latency(engine, batch)
             record_latency(engine, batch)
             record_latency(engine, batch)
 
-            # run_ds_flops_profile(engine, batch)
-
-            # engine(**batch, use_cache=False)
-            # record_expert_routing(engine, batch)
-            # record_latency(engine, batch)
-            # run_ds_comm_profile(engine, batch)
             run_pytorch_profile(engine, batch, outdir)
-            # run_ds_flops_profile(engine, batch)
 
-    # bookeeping
     report_peak_mem(engine.device)
     shutdown_comm()
 

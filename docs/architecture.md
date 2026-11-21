@@ -42,8 +42,8 @@ Imports point one way: each layer imports only from the layers above it in this 
 | `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `make_plan`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
 | `benchmark/utils.py` | Launch, recorded routing, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `make_inputs`, `time_ms` |
 | `benchmark/all2all/rbd_vs_plain.py` | RBD against plain on recorded routing. | |
-| `benchmark/all2all/even_vs_uneven.py` | One all2all with recorded (uneven) against even split sizes. | |
-| `benchmark/internode/` | Send/recv and all2all of expert weights within and between nodes. | |
+| `benchmark/all2all/even_vs_uneven.py` | One all2all with the recorded uneven split sizes against even split sizes. | |
+| `benchmark/internode/` | Send, receive and all2all of expert weights within and between nodes. | |
 | `benchmark/compute.py` | GEMM and Flash Attention compute, no communication. | |
 | `tests/test_rbd.py` | RBD against a locally computed answer, on CPU, for every pilot rule. | |
 | `scripts/`, `configs/`, `src/utils*.py` | Model-level runs through DeepSpeed, including the routing recorder. | |

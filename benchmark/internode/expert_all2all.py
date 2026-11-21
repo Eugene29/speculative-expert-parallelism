@@ -59,20 +59,16 @@ def get_splits(
     num_nodes = world // gpus_per_node
     num_remote = world - gpus_per_node
 
-    # Nothing to or from this node's own ranks, so every byte crosses the network.
     my_node = rank // gpus_per_node
     same_node = [r // gpus_per_node == my_node for r in range(world)]
 
     if balance == "even":
-        # Every rank sends the same chunk, so send and recv splits match.
         if numel % num_remote != 0:
             raise RuntimeError(f"{numel} elements don't split evenly across {num_remote} ranks.")
         chunk = numel // num_remote
         splits = [0 if same else chunk for same in same_node]
         return splits, splits
 
-    # Heavy ranks send numel * (1 + load_delta), light ranks numel * (1 - load_delta),
-    # so with half of each the average stays numel.
     heavy_chunk = numel * (1 + load_delta) / num_remote
     light_chunk = numel * (1 - load_delta) / num_remote
     if heavy_chunk != int(heavy_chunk) or light_chunk != int(light_chunk):
@@ -81,26 +77,21 @@ def get_splits(
     heavy_chunk, light_chunk = int(heavy_chunk), int(light_chunk)
 
     if balance == "uneven_internode":
-        # First half of nodes are heavy, second half light.
         if num_nodes % 2 != 0:
             raise RuntimeError(f"uneven_internode needs an even number of nodes, got {num_nodes}.")
         is_heavy = [r // gpus_per_node < num_nodes // 2 for r in range(world)]
         chunks = [heavy_chunk if heavy else light_chunk for heavy in is_heavy]
-        # Send my one chunk to every remote rank; receive each sender's own chunk.
         my_chunk = chunks[rank]
         send_splits = [0 if same else my_chunk for same in same_node]
         recv_splits = [0 if same else chunks[r] for r, same in enumerate(same_node)]
         return send_splits, recv_splits
 
     if balance == "uneven_intranode":
-        # First half of local ranks on every node are heavy, second half light,
-        # so every node sends the same total.
         if gpus_per_node % 2 != 0:
             raise RuntimeError(f"uneven_intranode needs an even number of GPUs per node, "
                                f"got {gpus_per_node}.")
         is_heavy = [r % gpus_per_node < gpus_per_node // 2 for r in range(world)]
         chunks = [heavy_chunk if heavy else light_chunk for heavy in is_heavy]
-        # Send my one chunk to every remote rank; receive each sender's own chunk.
         my_chunk = chunks[rank]
         send_splits = [0 if same else my_chunk for same in same_node]
         recv_splits = [0 if same else chunks[r] for r, same in enumerate(same_node)]
@@ -123,7 +114,6 @@ def benchmark(
         nbytes: average bytes each rank sends in total.
         times: ms of each timed all-to-all, the slowest of all ranks.
     """
-    # Gated FFNN: gate [I, H] + up [I, H] + down [H, I].
     numel = n * 3 * args.hidden * args.intermediate
     send_splits, recv_splits = get_splits(numel, rank, gpus_per_node,
                                           args.balance, args.load_delta)
@@ -138,14 +128,12 @@ def benchmark(
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iterations)]
 
     for start, end in zip(starts, ends):
-        # Line all ranks up so each all-to-all is timed on its own.
         dist.barrier()
         start.record()
         dist.all_to_all_single(recv_buf, send_buf, recv_splits, send_splits)
         end.record()
     torch.cuda.synchronize()
 
-    # The all-to-all is done only once every rank finishes; take the slowest rank.
     ms = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends)], device=device)
     dist.all_reduce(ms, op=dist.ReduceOp.MAX)
     return numel * send_buf.element_size(), ms.tolist()

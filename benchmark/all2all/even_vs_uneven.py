@@ -18,7 +18,6 @@ ITERATIONS = 5
 SCALE = 1
 
 
-# Count rows sent between every pair of ranks.
 def get_send_recv_splits(ids, E, rank, world, device, scale=SCALE):
     send = torch.bincount(
         ids.long().flatten().to(device) // (E // world),
@@ -54,10 +53,8 @@ def benchmark(name, send_splits, recv_splits):
     end.record()
     end.synchronize()
 
-    # Bytes this rank sends to other ranks (the self-copy never hits the network).
     row_bytes = H * x.element_size()
     sent = (sum(send_splits) - send_splits[rank]) * row_bytes
-    # Assume every rank sends the same amount as rank 0.
     total = sent * world
     ms = torch.tensor(start.elapsed_time(end) / ITERATIONS, device=device)
     dist.all_reduce(ms, op=dist.ReduceOp.MAX)
@@ -79,7 +76,6 @@ if __name__ == "__main__":
 
     rank, world, device = init_dist()
 
-    # Load this rank's expert assignments: [tokens, top_k].
     ids = torch.load(f"{run_dir}/experts_rank{rank}.pt", map_location="cpu")[layer]
     tokens, top_k = ids.shape
 

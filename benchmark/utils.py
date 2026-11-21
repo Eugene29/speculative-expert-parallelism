@@ -49,7 +49,6 @@ def check_node_layout(gpus_per_node: int) -> list[str]:
     hosts = [None] * world
     dist.all_gather_object(hosts, socket.gethostname())
 
-    # Every node should be a different host.
     node_hosts = hosts[::gpus_per_node]
     if len(set(node_hosts)) != num_nodes:
         raise RuntimeError(f"Some nodes share a host: {node_hosts}.")
@@ -108,8 +107,6 @@ def make_inputs(
     num_tokens, k = route.shape
     gen = torch.Generator(device=device).manual_seed(seed)
     tokens = torch.randn(num_tokens, H, generator=gen, device=device, dtype=torch.bfloat16)
-    # Softmax over each token's k experts, like a router renormalizing its top-k gates.
-    # Kept in float32 so rounding doesn't make RBD and plain outputs differ.
     logits = torch.randn(num_tokens, k, generator=gen, device=device)
     weights = logits.softmax(dim=-1)
     return tokens, weights
@@ -135,14 +132,12 @@ def time_ms(
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
     for start, end in zip(starts, ends):
-        # Line all ranks up so each call is timed on its own.
         dist.barrier()
         start.record()
         fn()
         end.record()
     torch.cuda.synchronize()
 
-    # A rank's call isn't done until its slowest peer finishes, so take the max rank.
     avg = sum(s.elapsed_time(e) for s, e in zip(starts, ends)) / iterations
     ms = torch.tensor(avg, device=torch.cuda.current_device())
     dist.all_reduce(ms, op=dist.ReduceOp.MAX)

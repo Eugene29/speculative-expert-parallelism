@@ -39,18 +39,14 @@ class Layout(NamedTuple):
     ep_size: int
 
 
-# Run only the smoke layout during development with -m smoke.
 LAYOUTS = [
     pytest.param(Layout(world=8, ep_size=8), id="2_nodes", marks=pytest.mark.smoke),
     pytest.param(Layout(world=4, ep_size=4), id="1_node"),
     pytest.param(Layout(world=12, ep_size=12), id="3_nodes"),
-    # 4 nodes as 2 EP groups of 2 nodes, as with autoep_size=8: the second group's
-    # EP ranks differ from its global ranks.
     pytest.param(Layout(world=16, ep_size=8), id="2_ep_groups"),
 ]
 
 
-# Each routing maps (generator, EP rank, E) to [num_tokens, k] experts per token.
 def _random(gen: torch.Generator, ep_rank: int, E: int) -> torch.Tensor:
     return torch.rand(NUM_TOKENS, E, generator=gen).topk(TOP_K, dim=-1).indices
 

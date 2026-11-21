@@ -11,16 +11,13 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-# Settings
-DTYPE = torch.bfloat16  # Change to torch.float16 if needed.
+DTYPE = torch.bfloat16
 WARMUP = 5
 ITERATIONS = 5
 
-# GEMM: [H, 4H] @ [4H, H]
 H = 2048
 H2 = 512
 
-# Attention: [batch, heads, sequence length, head dimension]
 BATCH, HEADS, SEQ_LEN, HEAD_DIM = 8, 32, 4096, 64
 CAUSAL = True
 
@@ -54,7 +51,6 @@ def main():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
     print(f"GPU: {torch.cuda.get_device_name()} | dtype: {DTYPE}")
 
-    # Allocate inputs and GEMM output before timing.
     a = torch.randn(H, H2, device="cuda", dtype=DTYPE)
     b = torch.randn(H2, H, device="cuda", dtype=DTYPE)
     out = torch.empty(H, H, device="cuda", dtype=DTYPE)
@@ -82,8 +78,6 @@ def main():
     with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
         attention_ms, attention_mem_mib = benchmark(attention)
         
-    # Count QK^T and attention_probs @ V; excludes softmax.
-    # Causal attention uses the lower triangle, including the diagonal.
     pairs = SEQ_LEN * (SEQ_LEN + 1) // 2 if CAUSAL else SEQ_LEN**2
 
     attention_flops = 4 * BATCH * HEADS * pairs * HEAD_DIM

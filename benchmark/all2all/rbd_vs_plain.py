@@ -75,14 +75,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     E, G = args.num_experts, args.gpus_per_node
 
-    # 1. Launch: NCCL over all ranks, plus one process group per node for RBD's stage 2.
     rank, world, device = init_dist()
     hosts = check_node_layout(G)
     if E % world != 0:
         raise RuntimeError(f"{E} experts don't split evenly across {world} ranks.")
     local_group, _ = dist.new_subgroups(group_size=G)
 
-    # 2. Inputs: this rank's share of the recorded routing, with random tokens and weights.
     route = load_routing(args.run_dir, args.layer, rank, world, E).to(device)
     tokens, weights = make_inputs(route, args.hidden, device, seed=rank)
     modes = {
@@ -95,12 +93,8 @@ if __name__ == "__main__":
         ),
     }
 
-    # 3. Count the rows each version sends between nodes.
     plain_rows, rbd_rows, copies = inter_node_rows(route, E, G)
 
-    # 4. Check against plain. An expert that scales by its id catches rows sent to the
-    # wrong expert. Every term of a token's output has the same sign, so a relative
-    # error is well defined.
     scale = lambda x, expert_ids: x * ((expert_ids + 1) / E).to(x.dtype).unsqueeze(-1)
     reference = modes["plain"](scale).float()
     errors = []
@@ -113,12 +107,10 @@ if __name__ == "__main__":
         raise RuntimeError(f"Output differs from plain by up to {errors.max():.2e} "
                            f"(relative).")
 
-    # 5. Time communication only: identity experts leave no compute in the measurement.
     identity = lambda x, expert_ids: x
     times = {name: time_ms(lambda: mode(identity), args.warmup, args.iterations)
              for name, mode in modes.items()}
 
-    # 6. Report.
     if rank == 0:
         print(
             f"{world // G} nodes x {G} GPUs: "
