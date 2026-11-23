@@ -27,7 +27,7 @@ In a blocking round trip the GPU idles while rows are on the network. The pipeli
 cuts a rank's tokens into `degree` slices and gives each slice its own round trip, so
 the experts of one slice run while the next slice is on the network.
 
-1. Per slice: plan it, then start its dispatch without waiting.
+1. Plan every slice, then start every slice's dispatch without waiting.
 2. Per slice: wait for its rows, run the experts, and start its combine without
    waiting.
 3. Per slice: wait for its returned rows and merge them.
@@ -35,6 +35,39 @@ the experts of one slice run while the next slice is on the network.
 `pipelined_rbd_combine_dispatch` uses RBD's stages and `pipelined_plain_combine_dispatch`
 the plain all2all. `expert` is called once per slice.
 
-The pipeline can hide at most the expert time, and it pays one plan per slice. A plan
-is host work that does not shrink with the slice, so the pipeline pays off only when
-the experts cost more than the extra plans.
+The RBD pipeline plans all slices in one exchange: `make_plans` gives the counts one
+block of columns per slice and reads every slice's split sizes in a single host sync,
+so a forward pays one plan whatever the degree, and one small all2all carries the
+pilot metadata of every slice. The plain pipeline still plans per slice.
+
+What a slice can hide is its stage 2 and its experts, under the stage 1 rows of the
+other slices. Two things bound it. With `degree` slices, the first dispatch and the
+last combine have nothing to run under, so at most `1 - 1/degree` of stage 1 is
+covered. And the transfers and the experts share the GPU: NCCL moves rows with its own
+kernels, so each runs slower while the other does
+(`benchmark/all2all/contention.py` measures by how much).
+
+## Guests: `src/guests.py`
+
+A guest is an expert of another node that a rank runs itself for one layer, from
+weights it loads out of host memory. A copy routed to a guest stays on its node, so
+guests of the experts a node asks other nodes for most remove pilots.
+
+1. `remote_demand` counts how often a rank's tokens ask for each expert of another
+   node, in any routing: the layer's own, a recording, or a prediction.
+2. `choose_guests` makes the experts in most demand guests. Unique placement adds the
+   demand of a node's ranks and deals the hottest experts over them, so no two ranks
+   of a node load the same one. Redundant placement lets every rank take its own
+   hottest experts, with no collective.
+3. A guest is a new expert id after its rank's own experts, the numbering of
+   `replicas.py`, so `rbd_combine_dispatch` and the pipeline run unchanged on
+   `Guests.grown[route]`.
+4. `GuestPool` holds the guests' weights on the GPU and refills them from pinned host
+   memory on a side stream. Two pools take turns, one for the running layer and one
+   for the next, so guests cost `2 * slots` experts of GPU memory whatever the depth.
+
+In the model (`scripts/ds_guests.py`, mode `rbd_guests`), MoE layer i chooses and
+starts loading the guests of layer i + 1, then runs with the guests chosen during
+layer i - 1. The next layer's guests come from its router applied to this layer's
+tokens (speculative), from a recording of another batch (static), or of this batch
+(oracle).

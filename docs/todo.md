@@ -37,8 +37,8 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
   routing is timed on one layer only.
 - [ ] Real replicas: load and hold the weights. `combine_dispatch --replicas` emulates
   them by rerouting. A replica per rank, not per node, is untried.
-- [ ] One plan for all slices of the pipeline. Each slice now pays a whole plan, about
-  2 ms, which is why pipelined RBD does not beat RBD.
+- [ ] One plan for all slices of the plain pipeline. `pipelined_plain_combine_dispatch`
+  still plans per slice; the RBD pipeline no longer does.
 - [ ] Plain's count exchange. It takes 1.9 ms of plain's 10 ms for a few bytes
   (Baselines 01). Tutel and DeepSpeed's MOELayer need no such exchange.
 - [ ] `even_vs_uneven.py`: count the off-rank bytes of every rank. It now multiplies

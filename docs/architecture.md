@@ -20,7 +20,7 @@ routing recorded from a real model and inside the model itself. Features that we
 | [concepts.md](architecture/concepts.md) | The vocabulary, one token's round trip step by step, and the assumptions. |
 | [plain.md](architecture/plain.md) | The plain reference that RBD is checked and timed against. |
 | [rbd.md](architecture/rbd.md) | How one RBD call works: planning, the `Plan`, the five stages, and the pilot rules. |
-| [variants.md](architecture/variants.md) | What two-lane and the pipeline change in an RBD call. |
+| [variants.md](architecture/variants.md) | What two-lane, the pipeline and guests change in an RBD call. |
 | [benchmarks.md](architecture/benchmarks.md) | What each benchmark measures and how `combine_dispatch` runs. |
 
 ## Layers
@@ -33,7 +33,8 @@ Imports point one way: each layer imports only from the layers above it in this 
    imports the other. `src/replicas.py` sits beside them: it only rewrites a routing
    before either runs, and imports neither.
 3. **The RBD variants: `src/two_lane.py` and `src/pipeline.py`.** Each is built on
-   `rbd.py` and `ops.py`; neither imports the other.
+   `rbd.py` and `ops.py`; neither imports the other. `src/guests.py` sits beside
+   `replicas.py`: it rewrites a routing and holds weights, and imports no algorithm.
 4. **Benchmarks: `benchmark/`.** Standalone scripts. The few helpers they share are
    in `benchmark/utils.py`.
 
@@ -45,15 +46,17 @@ Imports point one way: each layer imports only from the layers above it in this 
 |---|---|---|
 | `src/ops.py` | Operations shared by the algorithms. | `all2all`, `all2all_async`, `gather_sum` |
 | `src/plain.py` | The plain reference. | `plain_combine_dispatch` |
-| `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `make_plan`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
+| `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `make_plan`, `make_plans`, `token_slices`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
 | `src/replicas.py` | Replicas of experts on other nodes: choosing them, routing to them, and rewriting a routing so the dispatch functions use them. | `RULES`, `choose_replicas`, `serving_node`, `replica_ids`, `relabel`, `inter_node_rows` |
 | `benchmark/utils.py` | Launch, recorded routing, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `load_sample`, `expert_counts`, `make_inputs`, `time_ms` |
 | `src/two_lane.py` | RBD with stage 1 in two lanes. | `two_lane_plan`, `two_lane_dispatch`, `two_lane_combine`, `two_lane_rbd_combine_dispatch` |
 | `src/pipeline.py` | RBD and plain on slices of the tokens. | `pipelined_rbd_combine_dispatch`, `pipelined_plain_combine_dispatch` |
+| `src/guests.py` | Guest experts: choosing a rank's guests from routing demand, numbering them for RBD, and the GPU pool that loads their weights from host memory. | `Guests`, `remote_demand`, `choose_guests`, `no_guests`, `home_ids`, `GuestPool` |
 | `benchmark/all2all/modes.py` | Every dispatch-and-combine version behind one call, `mode(tokens, weights, expert, route)`. The layer benchmark and the model script both build their modes here. | `MODES`, `parse_mode`, `build_mode` |
 | `benchmark/all2all/combine_dispatch.py` | Every mode against plain on recorded routing, optionally with replicas. | |
 | `benchmark/all2all/baselines.py` | Tutel, DeepSpeed's MOELayer and AutoEP, and DeepEP behind the arguments of `plain_combine_dispatch`, with each library's settings as keyword arguments. | `tutel_combine_dispatch`, `ds_moe_combine_dispatch`, `autoep_combine_dispatch`, `capacity_kept`, `make_deepep_buffer`, `deepep_combine_dispatch` |
 | `benchmark/all2all/xmoe.py` | X-MoE's own RBD code behind the same arguments. | `xmoe_combine_dispatch` |
+| `benchmark/all2all/contention.py` | An all2all and expert compute alone and together on one GPU: what a pipeline can hide. | |
 | `benchmark/replica_count.py` | Rows that cross between nodes under every replica rule, budget and routing. CPU only. | |
 | `benchmark/hot_experts.py` | How stable the hot experts are across batches of recorded routing. | |
 | `benchmark/phase_clock.py` | Times every step a mode marks with `record_function("<mode>/<step>")` on the GPU's clock, with CUDA events and no profiler. The steps add up to the forward. | `PhaseClock`, `rank_mean`, `phase_line` |
@@ -67,7 +70,7 @@ Imports point one way: each layer imports only from the layers above it in this 
 | `tests/test_rbd.py`, `tests/test_two_lane.py`, `tests/test_pipeline.py` | RBD, two-lane and the pipeline through that check, for every pilot rule. | |
 | `tests/test_phase_clock.py` | The phase clock on one GPU: its phases add up to the wall time. | |
 | `tests/test_replicas.py` | Replica choice, routing and relabeling, on CPU. | |
-| `scripts/`, `configs/` | Model-level runs through DeepSpeed: `scripts/ds_moe.py --modes` times the model with any mode of `modes.py` as its MoE layers' dispatch, and `--record` saves the routing. Its helpers are in `scripts/ds_utils.py`. `scripts/record_routing.py` records routing on many batches with Hugging Face, and `scripts/jobs/` holds the job scripts behind the experiment pages. | |
+| `scripts/`, `configs/` | Model-level runs through DeepSpeed: `scripts/ds_moe.py --modes` times the model with any mode of `modes.py` as its MoE layers' dispatch, and `--record` saves the routing. Its helpers are in `scripts/ds_utils.py`. `scripts/ds_guests.py` is the model mode `rbd_guests`. `scripts/record_routing.py` records routing on many batches with Hugging Face, and `scripts/jobs/` holds the job scripts behind the experiment pages. | |
 
 ## Naming rules
 

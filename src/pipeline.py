@@ -6,27 +6,30 @@ run. The pipeline cuts this rank's tokens into `degree` slices and gives each sl
 its own round trip, so the experts of slice c run while slice c + 1 is on the network.
 
 Each function makes three passes over the slices:
-    1. Per slice: plan it and start its dispatch all2all, without waiting.
+    1. Plan the slices and start every slice's dispatch all2all, without waiting.
     2. Per slice: wait for its rows, run the experts on them, and start its combine
        all2all without waiting.
     3. Per slice: wait for its returned rows and merge them into its tokens.
 
 Two versions:
-    pipelined_rbd_combine_dispatch: RBD's stages, one spec_ep.rbd plan per slice.
-        Only the stage 1 all2alls over ep_group are started ahead. A slice's stage 2
-        over local_group and its experts run under the next slice's stage 1.
+    pipelined_rbd_combine_dispatch: RBD's stages on slices planned together
+        (spec_ep.rbd.start_plans): one exchange and one host sync for all of them. The
+        dispatches start as soon as the stage 1 rows are known, and the host-bound rest
+        of the plan (finish_plans) runs while they are on the network. Only the stage 1
+        all2alls over ep_group are started ahead. A slice's stage 2 over local_group
+        and its experts run under the next slice's stage 1.
     pipelined_plain_combine_dispatch: one row per (token, expert), planned per slice
         as spec_ep.plain plans a layer.
 
-Each slice is planned on its own, so planning costs `degree` times its exchanges and
-host syncs. Slice c is on the network while the host plans slice c + 1.
+The plain pipeline plans each slice on its own, so its planning costs `degree` times
+its exchanges and host syncs.
 
 The profiler label of an all2all started without waiting covers both its start and
 its wait. The event clock (spec_ep.phase_clock) sees such an all2all as one comm event
 from its start to its real end, over whatever the stream does meanwhile. Forward only,
 like spec_ep.rbd.
 
-TODO: Plan every slice in one exchange and one host sync.
+TODO: Plan every slice of the plain pipeline in one exchange and one host sync.
 
 Usage:
     from spec_ep.pipeline import pipelined_rbd_combine_dispatch
@@ -40,7 +43,7 @@ import torch.distributed as dist
 from torch.profiler import record_function
 
 from spec_ep.ops import all2all, all2all_async, gather_sum
-from spec_ep.rbd import make_plans, stage2_combine, stage2_dispatch, token_slices
+from spec_ep.rbd import finish_plans, stage2_combine, stage2_dispatch, start_plans, token_slices
 
 __all__ = ["pipelined_rbd_combine_dispatch", "pipelined_plain_combine_dispatch"]
 
@@ -74,14 +77,17 @@ def pipelined_rbd_combine_dispatch(
     """
     slices = token_slices(tokens.shape[0], degree)
     with record_function("autoep/rbd_plan"):
-        plans = make_plans(
+        start = start_plans(
             route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree
         )
     with record_function("autoep/rbd_stage1_dispatch"):
         arriving = [
-            all2all_async(tokens[s][plan.send1_token], plan.send1, plan.recv1, ep_group)
-            for s, plan in zip(slices, plans)
+            all2all_async(tokens[s][token], send, recv, ep_group)
+            for s, token, send, recv in zip(slices, start.send1_token, start.send1, start.recv1)
         ]
+    # The rest of the plan is host work, so it runs under the dispatches.
+    with record_function("autoep/rbd_plan"):
+        plans = finish_plans(start)
 
     returning = []
     for plan, wait in zip(plans, arriving):

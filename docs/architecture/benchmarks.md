@@ -10,6 +10,7 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 | `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD, two-lane and the pipelines, with Tutel, DeepSpeed's MOELayer and DeepEP as baselines. Also the same versions with the hot experts replicated on every node. |
 | `scripts/ds_moe.py` | The whole Qwen model, with any of the same modes as the dispatch of every MoE layer (`--modes`). One model load, a logits check, alternating timed forwards, then each mode's forward as a sum of its steps (`benchmark/phase_clock.py`) and a trace per mode. |
 | `benchmark/phase_clock.py` | The time of every step a mode marks, on the GPU's clock, without a profiler. `python -m benchmark.summarize MODEL.out --by phase` turns the model script's phase lines into a table. |
+| `benchmark/all2all/contention.py` | One all2all and one expert block, alone and overlapped on every rank: how much each slows the other, and what share of the experts a pipeline can hide. |
 | `benchmark/replica_count.py` | The rows that cross between nodes under every replica rule, budget and routing, on recorded routing. CPU only. |
 | `benchmark/hot_experts.py` | How stable the hot experts are from batch to batch, on recorded routing. CPU only. |
 | `benchmark/trace_report.py` | Where the GPU time of a `combine_dispatch --trace` run went, as a table and a timeline picture. CPU only. |
