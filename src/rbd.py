@@ -11,7 +11,8 @@ rbd_combine_dispatch() is a plan and five stages:
     1. stage1_dispatch, over ep_group: send each token straight to its experts on
        this node, and one pilot per other node it needs.
     2. stage2_dispatch, over local_group: each rank copies the pilots it received
-       to the experts they need on its node.
+       to the experts they need on its node. The experts then run on the direct rows
+       and on these.
     3. stage2_combine: replica outputs return to their pilot's rank, which scales
        and sums them into one row per pilot.
     4. stage1_combine: pilot sums and same-node outputs return to the source rank.
@@ -22,7 +23,9 @@ The plan is one Triton kernel on each side of stage 1. make_plan() runs _plan_ke
 over this rank's tokens: it classifies every copy, counts the rows of both stages per
 destination, and gives every stage 1 row its place among the rows of its bucket, all
 with atomic adds. The ranks exchange the counts in one small all2all, and one host
-sync reads every split size, which NCCL needs before it can receive. A stage 1 row is
+sync brings both count tables to the host, which NCCL needs for the split sizes. The
+tables are small, so the host does the rest of the arithmetic and sends back three
+short vectors. A stage 1 row is
 its token followed by the token's routing and weights, the metadata, so a pilot's rank
 reads from the row itself which experts to copy it to: stage2_dispatch() runs
 _fanout_kernel over the pilots that arrived. Expert ids are never sent. Rows of one
@@ -195,12 +198,12 @@ def _layout(
     Returns:
         order: [W * (L + 1)] the stage 1 buckets, as entries of the counts, in sending
             order. One lane: by rank, a rank's experts and then its pilots. Two lanes:
-            every rank's pilots, then every rank's experts.
-        ids: [2 * G * L] this rank's expert ids, G times for each stage.
+            every rank's pilots, then every rank's experts. On the host.
+        ids: [2 * G * L] this rank's expert ids, G times for each stage. On device.
     """
     G, L = gpus_per_node, experts_per_rank
-    first = torch.arange(world, device=device).unsqueeze(1) * (L + 1 + 2 * G * L)
-    experts, pilots = first + torch.arange(L, device=device), first + L
+    first = torch.arange(world).unsqueeze(1) * (L + 1 + 2 * G * L)
+    experts, pilots = first + torch.arange(L), first + L
     if lanes == 2:
         order = torch.cat([pilots.flatten(), experts.flatten()])
     else:
@@ -220,8 +223,8 @@ def make_plan(
 ) -> Plan:
     """Plan a layer's round trip. Collective over ep_group; sends no tokens.
 
-    One kernel over the tokens, one exchange of counts and one host sync. The
-    arguments are those of rbd_combine_dispatch().
+    One kernel over the tokens, one exchange of counts, one host sync, and a little
+    arithmetic on the host. The arguments are those of rbd_combine_dispatch().
 
     Args:
         lanes: 1 orders the stage 1 rows by destination rank, for one all2all over
@@ -251,32 +254,36 @@ def make_plan(
     with record_function("comm/both"):
         dist.all_to_all_single(arrived, counts, group=ep_group)
 
-    # A stage 1 row's place: where its bucket starts in the sending order, plus its
-    # slot. A copy that sends no row gets -1, which also parks its token in the spare
-    # last entry of send1_token.
+    # The one host sync: both tables, [W, C] each. The rest of this block runs on the host.
+    counts, arrived = torch.stack([counts, arrived]).cpu()
     order, ids = _layout(world, rank, G, L, lanes, device)
-    rows = counts.flatten()[order]
-    start = bucket.new_full((world * C + 1,), -1)
-    start[order] = rows.cumsum(0) - rows
-    final_index = start[bucket] + slot
-    send1_token = bucket.new_empty(T * k + 1)
-    send1_token[final_index.flatten()] = torch.arange(T * k, device=device) // k
-
-    # The one host sync: every split size. stage2 is [2G, L]: the rows this rank
-    # forwards to each rank of its node, then the rows it gets from each, per expert.
     lo = rank // G * G
+    # stage2 is [2G, L]: the rows this rank forwards to each rank of its node, then
+    # the rows it gets from each, per expert.
     stage2 = arrived[:, L + 1 :].view(world, 2 * G, L).sum(dim=0)
-    sizes = torch.cat(
-        [counts[:, : L + 1].sum(dim=1), arrived[:, : L + 1].sum(dim=1), stage2.sum(dim=1)]
-    ).tolist()
-    send1, recv1 = sizes[:world], sizes[world : 2 * world]
-    send2, recv2 = sizes[2 * world : 2 * world + G], sizes[2 * world + G :]
+    send1, recv1 = counts[:, : L + 1].sum(dim=1).tolist(), arrived[:, : L + 1].sum(dim=1).tolist()
+    send2, recv2 = stage2[:G].sum(dim=1).tolist(), stage2[G:].sum(dim=1).tolist()
     num_direct = sum(recv1[lo : lo + G])
     num_pilots = sum(recv1) - num_direct
     first_direct = num_pilots if lanes == 2 else sum(recv1[:lo])
-    pilot_row = torch.arange(num_pilots, device=device)
+    # Where each bucket's rows start in the sending order; -1 for the spare.
+    rows = counts.flatten()[order]
+    start = torch.full((world * C + 1,), -1)
+    start[order] = rows.cumsum(0) - rows
     forward = stage2[:G].flatten()
     rows_in = torch.cat([arrived[lo : lo + G, :L], stage2[G:]]).flatten()
+    start, send2_start, rows_in = (
+        torch.cat([start, forward.cumsum(0) - forward, rows_in])
+        .to(device)
+        .split([start.numel(), forward.numel(), rows_in.numel()])
+    )
+
+    # A stage 1 row's place is its bucket's start plus its slot. A copy that sends no
+    # row gets -1, which also parks its token in the spare last entry of send1_token.
+    final_index = start[bucket] + slot
+    send1_token = bucket.new_empty(T * k + 1)
+    send1_token[final_index.flatten()] = torch.arange(T * k, device=device) // k
+    pilot_row = torch.arange(num_pilots, device=device)
     return Plan(
         send1_token=send1_token[: sum(send1)],
         send1=send1,
@@ -285,7 +292,7 @@ def make_plan(
         pilot_row=pilot_row + num_direct * (pilot_row >= first_direct),
         send2=send2,
         recv2=recv2,
-        send2_start=forward.cumsum(0) - forward,
+        send2_start=send2_start,
         first_expert=lo * L,
         expert_ids=ids.repeat_interleave(rows_in, output_size=num_direct + sum(recv2)),
         final_index=final_index,
@@ -348,33 +355,27 @@ def stage2_dispatch(
     received: torch.Tensor,
     plan: Plan,
     local_group: dist.ProcessGroup,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, Merge]:
     """Copy received pilots to their experts on this node. Collective over local_group.
 
     Args:
         received: [sum(recv1), H + M] the rows stage 1 received.
+        out: [sum(recv2), H] buffer to receive into. Allocated if None.
 
     Returns:
-        expert_inputs: [num_inputs, H] direct rows, then stage 2 rows, in the order of
-            plan.expert_ids.
+        rows: [sum(recv2), H] the stage 2 rows, in the order of
+            plan.expert_ids[num_direct:].
         merge: What stage2_combine() sums each pilot's replicas with.
     """
     with record_function("autoep/rbd_plan"):
         send2_row, merge = _fan_out(received, plan)
     with record_function("autoep/rbd_stage2_dispatch"):
-        start, end = plan.direct
         H = received.shape[1] - plan.meta.shape[1] * 4 // received.element_size()
-        expert_inputs = received.new_empty((end - start + sum(plan.recv2), H))
-        all2all(
-            received[send2_row, :H],
-            plan.send2,
-            plan.recv2,
-            local_group,
-            out=expert_inputs[end - start :],
-            link="intra",
+        rows = all2all(
+            received[send2_row, :H], plan.send2, plan.recv2, local_group, out=out, link="intra"
         )
-        expert_inputs[: end - start].copy_(received[start:end, :H])
-    return expert_inputs, merge
+    return rows, merge
 
 
 def stage2_combine(
@@ -382,24 +383,20 @@ def stage2_combine(
     plan: Plan,
     merge: Merge,
     local_group: dist.ProcessGroup,
-) -> torch.Tensor:
+    back: torch.Tensor,
+) -> None:
     """Return replica outputs to their pilot's rank and sum them. Collective over local_group.
 
-    Returns:
-        back: [sum(recv1), H] the stage 1 buffer rebuilt: direct outputs in their
-            block, and each pilot's weighted sum in its row.
+    Args:
+        outputs: [sum(recv2), H] expert outputs of the stage 2 rows.
+        back: [sum(recv1), H] the stage 1 buffer being rebuilt. Each pilot's weighted
+            sum is written to its row; the caller fills the direct rows.
     """
     with record_function("autoep/rbd_stage2_combine"):
-        start, end = plan.direct
-        num_direct = end - start
-        outputs = outputs.contiguous()
         returned = all2all(
-            outputs[num_direct:], plan.recv2, plan.send2, local_group, link="intra"
+            outputs.contiguous(), plan.recv2, plan.send2, local_group, link="intra"
         )
-        back = outputs.new_empty((sum(plan.recv1), outputs.shape[1]))
-        back[start:end].copy_(outputs[:num_direct])
         gather_sum(returned, merge.index, merge.weight, out=back, out_rows=plan.pilot_row)
-    return back
 
 
 def stage1_combine(
@@ -480,10 +477,16 @@ def rbd_combine_dispatch(
     """
     with record_function("autoep/rbd_plan"):
         plan = make_plan(route, weights, num_experts, gpus_per_node, ep_group, pilot_rule)
+    H, (start, end) = tokens.shape[1], plan.direct
+    num_direct = end - start
     received = stage1_dispatch(tokens, plan, ep_group)
-    expert_inputs, merge = stage2_dispatch(received, plan, local_group)
+    inputs = tokens.new_empty((num_direct + sum(plan.recv2), H))
+    _, merge = stage2_dispatch(received, plan, local_group, out=inputs[num_direct:])
+    inputs[:num_direct].copy_(received[start:end, :H])
     with record_function("autoep/rbd_experts"):
-        outputs = expert(expert_inputs, plan.expert_ids)
-    back = stage2_combine(outputs, plan, merge, local_group)
+        outputs = expert(inputs, plan.expert_ids)
+    back = tokens.new_empty((sum(plan.recv1), H))
+    back[start:end].copy_(outputs[:num_direct])
+    stage2_combine(outputs[num_direct:], plan, merge, local_group, back)
     returned = stage1_combine(back, plan, ep_group)
     return final_merge(returned, plan)

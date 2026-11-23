@@ -3,10 +3,16 @@
 spec_ep.guests chooses guests and moves their weights; this file connects it to the
 AutoEP layers of scripts/ds_moe.py as the mode rbd_guests. Every rank has `slots` guest
 slots that all layers share. In MoE layer i every rank starts pulling layer i + 1's
-guests from the ranks that own them, GPU to GPU on a communicator of its own, so the
-transfer runs under layer i. Layer i + 1 then runs RBD on its routing relabeled to its
-guests: lanes=2 (default) is two-lane RBD, which sends the same-node rows that guests
-create over the node's own communicator; lanes=1 is RBD in one all2all.
+guests from the ranks that own them, GPU to GPU on a communicator of its own. Layer
+i + 1 then runs RBD on its routing relabeled to its guests: lanes=2 (default) is
+two-lane RBD, which sends the same-node rows that guests create over the node's own
+communicator; lanes=1 is RBD in one all2all.
+
+When the transfer starts (under):
+    attention (default): when layer i has finished, so the weights travel under the
+        attention between the two MoE layers, while the network is idle.
+    layer: at the top of layer i, so they travel under that layer. They then share
+        the network with the layer's pilots, which slows the pilots down.
 
 Where a layer's guests come from (source):
     speculative: layer i + 1's router applied to the tokens entering layer i's MoE.
@@ -62,6 +68,7 @@ from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 SOURCES = ("speculative", "static", "oracle")
 PLACEMENTS = ("unique", "redundant")
 CHOICES = ("demand", "pilots")
+UNDER = ("attention", "layer")
 
 
 def _grouped_mm(
@@ -127,6 +134,8 @@ class GuestDispatch:
         choice: str = "demand",
         rounds: int = 4,
         balance: float = 0.0,
+        under: str = "attention",
+        early: float | None = None,
         routing: torch.Tensor | None = None,
     ) -> None:
         """Set the mode up. Collective for the recorded sources.
@@ -143,23 +152,30 @@ class GuestDispatch:
             choice: "demand" or "pilots"; see the module docstring.
             rounds: Batches the pilots choice takes its guests in.
             balance: How strongly the pilots choice prefers the busiest node.
+            under: "attention" or "layer"; see the module docstring.
+            early: Passed to two-lane RBD: the share of the direct rows whose experts
+                run while the pilots travel out. None runs the experts once.
             routing: [num_layers, num_tokens, k] recorded experts of this rank, for the
                 static and oracle sources.
         """
-        if source not in SOURCES or placement not in PLACEMENTS or choice not in CHOICES:
-            raise ValueError(f"source must be one of {SOURCES}, placement one of {PLACEMENTS} "
-                             f"and choice one of {CHOICES}.")
+        if (source not in SOURCES or placement not in PLACEMENTS or choice not in CHOICES
+                or under not in UNDER):
+            raise ValueError(f"source must be one of {SOURCES}, placement one of {PLACEMENTS}, "
+                             f"choice one of {CHOICES} and under one of {UNDER}.")
         self.layers, self.slots, self.source = layers, slots, source
         self.by_pilots, self.rounds, self.balance = choice == "pilots", rounds, balance
+        self.under_layer = under == "layer"
         self.G, self.ep_group, self.fetch_group = gpus_per_node, layers[0].ep_group, fetch_group
         self.node_group = local_group if placement == "unique" else None
         self.world, self.rank = dist.get_world_size(self.ep_group), dist.get_rank(self.ep_group)
         self.E, self.L = layers[0].num_experts, layers[0].num_local_experts
         self.device = layers[0].experts.w1.device
         self.none = no_guests(self.E, slots, self.world, self.device)
-        rbd = two_lane_rbd_combine_dispatch if lanes == 2 else rbd_combine_dispatch
-        self.inner = partial(rbd, gpus_per_node=gpus_per_node, local_group=local_group,
-                             ep_group=self.ep_group)
+        self.inner = partial(rbd_combine_dispatch, gpus_per_node=gpus_per_node,
+                             local_group=local_group, ep_group=self.ep_group)
+        if lanes == 2:
+            self.inner = partial(two_lane_rbd_combine_dispatch, gpus_per_node=gpus_per_node,
+                                 local_group=local_group, ep_group=self.ep_group, early=early)
         self.pool = GuestPool(_weights(layers[0]), slots, fetch_group)
 
         # Recorded sources know every layer's guests and transfers now; a prediction
@@ -220,7 +236,29 @@ class GuestDispatch:
             guests, predicted = self.guests, self.predicted
         held, times = self.pool.take(), self.pool.times[self.pool.current]
 
-        # Start pulling the next layer's guests. They travel under this layer.
+        run = partial(self._run_experts, self.layers[i], held)
+        if self.under_layer:
+            self._fetch_next(i, tokens)
+        output = self.inner(tokens, weights, run, guests.grown[route], guests.num_experts)
+        if not self.under_layer:
+            self._fetch_next(i, tokens)
+        if self.stats is not None and i:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._score(route, guests, predicted, times, begin, end)
+        return output
+
+    def _fetch_next(self, i: int, tokens: torch.Tensor) -> None:
+        """Start pulling the guests of the layer after layer i. Collective.
+
+        The transfer starts on the GPU once everything queued so far has run: called
+        before layer i's dispatch it travels under that layer, called after it under
+        the attention that follows.
+
+        Args:
+            tokens: [num_tokens, H] the tokens entering layer i's MoE, which a
+                prediction is made from.
+        """
         if self.recorded is not None:
             following = (i + 1) % len(self.layers)
             self._fetch(following, self.recorded[following][1])
@@ -229,14 +267,6 @@ class GuestDispatch:
             self.predicted = following.router.forward(tokens, following.expert_bias)[1]
             self.guests = self._choose(self.predicted)
             self._fetch(i + 1, exchange_requests(self.guests.slot_expert, self.L, self.fetch_group))
-
-        run = partial(self._run_experts, self.layers[i], held)
-        output = self.inner(tokens, weights, run, guests.grown[route], guests.num_experts)
-        if self.stats is not None and i:
-            end = torch.cuda.Event(enable_timing=True)
-            end.record()
-            self._score(route, guests, predicted, times, begin, end)
-        return output
 
     def _run_experts(
         self,

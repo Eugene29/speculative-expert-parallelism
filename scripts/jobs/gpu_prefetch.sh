@@ -56,7 +56,7 @@ step() {
 all="srun -N $N --ntasks-per-node=4 --kill-on-bad-exit=1"
 one="srun -N 1 -n 1 --gpus=1 -w $MASTER_ADDR"
 model="$PY -u scripts/ds_moe.py --config-pth configs/qwen_ep$((4 * N)).json --model $MODEL \
-    ${LAYERS:+--layers $LAYERS} --repeats 5 --profile events"
+    ${LAYERS:+--layers $LAYERS} --repeats 5 --profile ${PROFILE:-events}"
 
 # The plan's compute on one GPU, at the model's layer shape on 2 and on 4 nodes.
 if wants plan; then
