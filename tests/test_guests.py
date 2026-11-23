@@ -4,7 +4,8 @@ Every rank takes the layer's own routing as its demand, chooses guests, and runs
 the relabeled routing, through the check of tests/checks.py. The experts scale a row
 by its original expert id, so a copy served by the wrong guest changes the output. Each
 run also checks what the placement promises: unique guests are distinct within a node,
-and a copy only moves to a guest of its own node.
+and a copy only moves to a guest of its own node. The pool that holds the guests'
+weights is checked on one GPU.
 
 Usage:
     python -m pytest tests/test_guests.py -m smoke   # 2_nodes only, for development
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 from checks import LAYOUTS, Layout, run_check
-from spec_ep.guests import choose_guests, home_ids, remote_demand
+from spec_ep.guests import GuestPool, choose_guests, home_ids, remote_demand
 from spec_ep.pipeline import pipelined_rbd_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
 
@@ -82,3 +83,29 @@ def test_guests_match_local_reference(tmp_path: Path, layout: Layout) -> None:
         "redundant guests": partial(_with_guests, unique=False, degree=1),
         "unique guests, pipeline": partial(_with_guests, unique=True, degree=2),
     })
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the pool lives on a GPU")
+def test_pool_loads_rows_and_keeps_weights_in_use() -> None:
+    """A load fills the slots it is given, and waits for work queued on the old weights."""
+    device = torch.device("cuda")
+    sources = [torch.randn(6, 4, 3).pin_memory(), torch.randn(6, 5).pin_memory()]
+    pool = GuestPool([torch.Size((4, 3)), torch.Size((5,))], 3, torch.float32, device)
+
+    pool.load(sources, [4, -1, 0])
+    pool.wait()
+    for weight, source in zip(pool.weights, sources):
+        torch.testing.assert_close(weight[[0, 2]].cpu(), source[[4, 0]])
+
+    # Work queued before the next load still reads the old weights, however long it
+    # takes to get to them.
+    busy = torch.randn(4096, 4096, device=device)
+    for _ in range(20):
+        busy = busy @ busy.T / 4096
+    before = pool.weights[0][0] * 1.0
+    pool.load(sources, [1, 2, 3])
+    pool.wait()
+    torch.testing.assert_close(before.cpu(), sources[0][4])
+    torch.testing.assert_close(pool.weights[0].cpu(), sources[0][1:4])
+    torch.cuda.synchronize()
+    assert pool.started.elapsed_time(pool.loaded) >= 0
