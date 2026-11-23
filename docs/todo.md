@@ -124,6 +124,12 @@ functions of `rbd.py`, and `ops.py`.
 
 Finished items move here with the date and where the result is written up.
 
+- [x] 2026-11-22. Why pipelining gained nothing for Tutel and RBD, and one plan for
+  all slices of the RBD pipeline, with its tail under the dispatch: 1.134x over RBD
+  in the Qwen model (Pipeline 01).
+- [x] 2026-11-22. Expert offload as guests: hot experts of other nodes loaded from
+  pinned host memory one layer ahead, chosen by the next layer's router, on two-lane
+  RBD: 1.30x over RBD and 1.10x over two-lane at 24 guests per rank (Guests 01).
 - [x] 2026-11-22. Every library in one table, on one layer and in the Qwen model, on
   2 and 4 nodes: DeepEP, Tutel, AutoEP, DeepSpeed's MOELayer, RBD, two-lane and X-MoE
   through `benchmark/all2all/modes.py` (Baselines 02), with their profiles (Profiles 01).
