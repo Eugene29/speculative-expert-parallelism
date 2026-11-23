@@ -96,7 +96,7 @@ def check_store(
 ) -> None:
     """Fail unless every stored expert is the one its owner holds. Collective over the EP group.
 
-    Every rank takes the sum of squares of each of its own experts' first weight tensor
+    Every rank takes the sum of squares of each of its own experts' three weight tensors
     in every layer, the ranks exchange them, and each compares them with those of its
     store's rows. A store row that holds another expert, or another layer's, does not
     match: two experts' sums of squares differ far more than rounding does.
@@ -104,15 +104,18 @@ def check_store(
     group = layers[0].ep_group
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     energy = lambda w: w.float().square().sum(dim=(1, 2), dtype=torch.float64)
-    own = torch.stack([energy(layer.experts.w1) for layer in layers])
+    own = torch.stack([
+        torch.cat([energy(w) for w in (layer.experts.w1, layer.experts.w2, layer.experts.w3)])
+        for layer in layers
+    ])  # [num_layers, 3 * L]: the experts' w1, then w2, then w3
     owners = own.new_empty((world * own.shape[0], own.shape[1]))
     dist.all_gather_into_tensor(owners, own, group=group)
-    truth = owners.view(world, *own.shape).permute(1, 0, 2).flatten(1).cpu()  # [num_layers, E]
-    per_node = truth.shape[1] // (world // gpus_per_node)
-    remote = torch.ones(truth.shape[1], dtype=torch.bool)
+    truth = owners.view(world, own.shape[0], 3, -1).permute(1, 2, 0, 3).flatten(2).cpu()
+    per_node = truth.shape[2] // (world // gpus_per_node)
+    remote = torch.ones(truth.shape[2], dtype=torch.bool)
     remote[rank // gpus_per_node * per_node :][:per_node] = False
-    kept = torch.stack([energy(weights[0]) for weights in store])
-    wrong = ((kept - truth[:, remote]).abs() > 1e-5 * kept).sum().item()
+    kept = torch.stack([torch.stack([energy(w) for w in weights]) for weights in store])
+    wrong = ((kept - truth[:, :, remote]).abs() > 1e-5 * kept).any(dim=1).sum().item()
     if wrong:
         raise RuntimeError(f"rank {rank}: {wrong} stored experts differ from their owner's weights.")
 
@@ -340,10 +343,13 @@ class GuestDispatch:
             hot-set recall: share of the oracle's guests that are also guests here.
             token recall: share of a token's real experts that the prediction also
                 picked (speculative only), and its range over the layers.
-            load: milliseconds the copies of one layer's guests took, the MoE layer
-                they ran under, in how many layers the load was the shorter of the
-                two, and how long before their first use the guests were ready (a
-                negative time means the stream waited for them).
+            load: milliseconds the copies of one layer's guests took, how long that
+                MoE layer itself then took, in how many layers the load was the
+                shorter of the two, and how long before their first use the guests
+                were ready (a negative time means the stream waited for them). The
+                copies run before the layer that uses them, under the previous layer
+                and the attention between the two, so the layer's time is a yardstick
+                for one MoE layer and not the span the load ran in.
 
         Args:
             forward: Runs one forward of the model on this rank.
@@ -379,8 +385,8 @@ class GuestDispatch:
             print0(f"{name}: token recall {statistics.mean(recall):.1%} "
                    f"(layers {min(recall):.1%} to {max(recall):.1%}) | per layer "
                    + " ".join(f"{r:.2f}" for r in recall))
-        print0(f"{name}: load median {statistics.median(load):.2f} ms (max {max(load):.2f}) under "
+        print0(f"{name}: load median {statistics.median(load):.2f} ms (max {max(load):.2f}) against "
                f"a MoE layer of {statistics.median(layer):.2f} ms, slowest rank per layer | shorter "
-               f"than its layer in {sum(a <= b for a, b in zip(load, layer))} of {len(load)} layers "
+               f"than the layer it is for in {sum(a <= b for a, b in zip(load, layer))} of {len(load)} layers "
                f"| ready {min(slack, default=float('nan')):.2f} ms before first use at worst, "
                f"{statistics.median(slack) if slack else float('nan'):.2f} median")
