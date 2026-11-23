@@ -20,7 +20,14 @@ import torch
 import torch.distributed as dist
 
 from checks import LAYOUTS, Layout, run_check
-from spec_ep.guests import GuestPool, choose_guests, home_ids, remote_demand
+from spec_ep.guests import (
+    GuestPool,
+    choose_guests,
+    choose_guests_by_pilots,
+    home_ids,
+    pilot_credit,
+    remote_demand,
+)
 from spec_ep.pipeline import pipelined_rbd_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
 from spec_ep.two_lane import two_lane_rbd_combine_dispatch
@@ -40,6 +47,7 @@ def _with_guests(
     pilot_rule: str,
     unique: bool,
     dispatch: Callable[..., torch.Tensor],
+    by_pilots: bool = False,
 ) -> torch.Tensor:
     """An RBD variant with guests chosen from the routing itself.
 
@@ -50,7 +58,11 @@ def _with_guests(
     G, L = gpus_per_node, num_experts // world
     node = rank // G
     demand = remote_demand(route, num_experts, node, world // G)
-    guests = choose_guests(demand, SLOTS, G, local_group if unique else None, ep_group)
+    node_group = local_group if unique else None
+    if by_pilots:
+        guests = choose_guests_by_pilots(route, num_experts, SLOTS, G, node_group, ep_group, rounds=2)
+    else:
+        guests = choose_guests(demand, SLOTS, G, node_group, ep_group)
 
     held = guests.slot_expert[guests.slot_expert >= 0]
     assert (held // (L * G) != node).all(), "a guest is an expert of this rank's own node"
@@ -88,7 +100,29 @@ def test_guests_match_local_reference(tmp_path: Path, layout: Layout) -> None:
         "unique guests, pipeline": partial(
             _with_guests, unique=True, dispatch=partial(pipelined_rbd_combine_dispatch, degree=2)
         ),
+        "unique guests by pilots, two-lane pipeline": partial(
+            _with_guests, unique=True, by_pilots=True,
+            dispatch=partial(pipelined_rbd_combine_dispatch, degree=2, lanes=2),
+        ),
+        "redundant guests by pilots": partial(
+            _with_guests, unique=False, by_pilots=True, dispatch=rbd_combine_dispatch
+        ),
     })
+
+
+def test_pilot_credit_prefers_the_expert_that_frees_pilots() -> None:
+    """Credit adds up to the pilots and ranks an expert by the pilots a guest of it frees.
+
+    Node 0 holds experts 0 to 7. Three tokens need expert 8 and one more expert of node
+    1 each, so a guest of 8 frees no pilot. Two tokens need only expert 13 there.
+    """
+    route = torch.tensor([[8, 9], [8, 10], [8, 11], [0, 13], [0, 13]])
+    demand = remote_demand(route, 16, node=0, num_nodes=2)
+    credit = pilot_credit(route, 16, node=0, num_nodes=2)
+    assert demand.argmax() == 8 and credit.argmax() == 13
+    assert credit.sum() == 5, "one pilot per token"
+    taken = torch.arange(16) == 13
+    assert pilot_credit(route, 16, 0, 2, taken).sum() == 3, "a guest of 13 frees two pilots"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the pool lives on a GPU")

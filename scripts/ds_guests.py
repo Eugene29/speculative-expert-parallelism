@@ -12,8 +12,8 @@ AutoEP layers of scripts/ds_moe.py:
           2. runs RBD for layer i on the routing relabeled to the guests chosen during
              layer i - 1, running a row of a guest with the pool's weights. lanes=2
              (default) is two-lane RBD, which sends the same-node rows that guests
-             create over the node's own communicator; lanes=1 is RBD in one all2all,
-             and degree > 1 its pipeline.
+             create over the node's own communicator; lanes=1 is RBD in one all2all.
+             degree > 1 is the RBD pipeline on those lanes.
         So a layer's guests load under the previous layer, and two pools of `slots`
         experts are all the GPU memory guests take. A predicted choice reaches the
         host on a side stream and is read after the layer's own host syncs, so
@@ -49,7 +49,14 @@ import torch
 import torch.distributed as dist
 from deepspeed.moe.ep_experts import GroupedExperts
 
-from spec_ep.guests import GuestPool, Guests, choose_guests, no_guests, remote_demand
+from spec_ep.guests import (
+    GuestPool,
+    Guests,
+    choose_guests,
+    choose_guests_by_pilots,
+    no_guests,
+    remote_demand,
+)
 from spec_ep.pipeline import pipelined_rbd_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
 from spec_ep.two_lane import two_lane_rbd_combine_dispatch
@@ -141,6 +148,8 @@ class GuestDispatch:
         placement: str = "unique",
         lanes: int = 2,
         degree: int = 1,
+        choice: str = "demand",
+        rounds: int = 4,
         routing: torch.Tensor | None = None,
     ) -> None:
         """Set the mode up. Collective over local_group for recorded unique guests.
@@ -154,15 +163,17 @@ class GuestDispatch:
             source: "speculative", "static" or "oracle"; see the module docstring.
             placement: "unique" or "redundant"; see spec_ep.guests.
             lanes: 2 for two-lane RBD, 1 for RBD in one all2all.
-            degree: Slices of the one-lane RBD pipeline; 1 is no pipeline.
+            degree: Slices of the RBD pipeline; 1 is no pipeline.
+            choice: "demand" takes the experts with the most copies, "pilots" the ones
+                that keep the most pilots alive (spec_ep.guests.choose_guests_by_pilots).
+            rounds: Batches the pilots choice takes its guests in.
             routing: [num_layers, num_tokens, k] recorded experts of this rank, for the
                 static and oracle sources.
         """
         if source not in SOURCES or placement not in PLACEMENTS:
             raise ValueError(f"source must be one of {SOURCES} and placement one of {PLACEMENTS}.")
-        if lanes == 2 and degree > 1:
-            raise ValueError("The pipeline runs on one lane: set lanes=1 with degree > 1.")
         self.layers, self.store, self.slots, self.source = layers, store, slots, source
+        self.by_pilots, self.rounds = choice == "pilots", rounds
         self.G, self.ep_group = gpus_per_node, layers[0].ep_group
         self.node_group = local_group if placement == "unique" else None
         self.world, self.rank = dist.get_world_size(self.ep_group), dist.get_rank(self.ep_group)
@@ -172,7 +183,7 @@ class GuestDispatch:
         rbd = dict(gpus_per_node=gpus_per_node, local_group=local_group, ep_group=self.ep_group)
         self.inner = partial(two_lane_rbd_combine_dispatch if lanes == 2 else rbd_combine_dispatch, **rbd)
         if degree > 1:
-            self.inner = partial(pipelined_rbd_combine_dispatch, degree=degree, **rbd)
+            self.inner = partial(pipelined_rbd_combine_dispatch, degree=degree, lanes=lanes, **rbd)
         # A predicted choice comes to the host through this stream and buffer.
         self.reader = torch.cuda.Stream(self.device)
         self.slot_host = torch.empty(slots, dtype=torch.long).pin_memory()
@@ -212,6 +223,10 @@ class GuestDispatch:
 
     def _choose(self, route: torch.Tensor) -> Guests:
         """Choose guests for a layer from a routing of this rank's tokens. Collective if unique."""
+        if self.by_pilots:
+            return choose_guests_by_pilots(
+                route, self.E, self.slots, self.G, self.node_group, self.ep_group, self.rounds
+            )
         node, num_nodes = self.rank // self.G, self.world // self.G
         demand = remote_demand(route, self.E, node, num_nodes)
         return choose_guests(demand, self.slots, self.G, self.node_group, self.ep_group)

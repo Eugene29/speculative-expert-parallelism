@@ -39,6 +39,8 @@ from spec_ep.ops import all2all, all2all_async
 from spec_ep.rbd import Plan, final_merge, make_plan, stage2_combine, stage2_dispatch
 
 __all__ = [
+    "pilots_first",
+    "two_lane_all2all_async",
     "two_lane_plan",
     "two_lane_dispatch",
     "two_lane_combine",
@@ -67,22 +69,50 @@ def _block_to_end(index: torch.Tensor, start: int, end: int, total: int) -> torc
     return torch.where(index < start, index, moved)
 
 
-def _two_lane_all2all(
+def pilots_first(
+    rows: torch.Tensor,
+    send: list[int],
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Reorder stage 1 rows from rank order to the two-lane order.
+
+    Args:
+        rows: [sum(send), ...] one entry per stage 1 row, by destination rank.
+        send: Stage 1 rows sent to each rank of ep_group.
+
+    Returns:
+        rows: The pilots, then the rows for this node's ranks.
+    """
+    lo, hi = _node_ranks(gpus_per_node, ep_group)
+    first = sum(send[:lo])
+    last = first + sum(send[lo:hi])
+    return torch.cat([rows[:first], rows[last:], rows[first:last]])
+
+
+def two_lane_all2all_async(
     rows: torch.Tensor,
     send: list[int],
     recv: list[int],
     gpus_per_node: int,
     local_group: dist.ProcessGroup,
-    ep_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    """all2all of stage 1 rows in two lanes: pilots over ep_group, direct rows over local_group.
+    ep_group: dist.ProcessGroup | None = None,
+    block: bool = False,
+) -> Callable[[], torch.Tensor]:
+    """Start an all2all of stage 1 rows in two lanes. Collective over both groups.
 
     rows holds the pilots, then the direct rows. send and recv are per rank of
-    ep_group, as in all2all. The local lane is started first and waited for last, so
-    the pilots cross the network while it is in flight.
+    ep_group, as in all2all. The pilots go over ep_group and the direct rows over
+    local_group. The local lane is started first and waited for last, so the pilots
+    cross the network while it is in flight.
+
+    Args:
+        block: Finish the network lane before returning, which leaves only the local
+            lane to wait for.
 
     Returns:
-        out: [sum(recv), H] received pilots, then direct rows, each by source rank.
+        wait: Blocks until both lanes have arrived, then returns the [sum(recv), H]
+            received pilots, then direct rows, each by source rank.
     """
     lo, hi = _node_ranks(gpus_per_node, ep_group)
     idle = [0] * gpus_per_node
@@ -91,14 +121,39 @@ def _two_lane_all2all(
     num_sent, num_recv = sum(network_send), sum(network_recv)
 
     out = rows.new_empty((sum(recv), rows.shape[1]))
-    wait = all2all_async(
+    wait_local = all2all_async(
         rows[num_sent:], send[lo:hi], recv[lo:hi], local_group, out=out[num_recv:], link="intra"
     )
-    all2all(
+    network = all2all if block else all2all_async
+    wait_network = network(
         rows[:num_sent], network_send, network_recv, ep_group, out=out[:num_recv], link="inter"
     )
-    wait()
-    return out
+
+    def wait() -> torch.Tensor:
+        if not block:
+            wait_network()
+        wait_local()
+        return out
+
+    return wait
+
+
+def _two_lane_all2all(
+    rows: torch.Tensor,
+    send: list[int],
+    recv: list[int],
+    gpus_per_node: int,
+    local_group: dist.ProcessGroup,
+    ep_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """two_lane_all2all_async() with the network lane blocking, waited for.
+
+    Returns:
+        out: [sum(recv), H] received pilots, then direct rows, each by source rank.
+    """
+    return two_lane_all2all_async(
+        rows, send, recv, gpus_per_node, local_group, ep_group, block=True
+    )()
 
 
 def two_lane_plan(
@@ -121,9 +176,8 @@ def two_lane_plan(
     send_hi = send_lo + sum(plan.send1[lo:hi])
     recv_lo, recv_hi = plan.direct
     num_send1, num_recv1 = sum(plan.send1), sum(plan.recv1)
-    token = plan.send1_token
     return plan._replace(
-        send1_token=torch.cat([token[:send_lo], token[send_hi:], token[send_lo:send_hi]]),
+        send1_token=pilots_first(plan.send1_token, plan.send1, gpus_per_node, ep_group),
         direct=(num_recv1 - (recv_hi - recv_lo), num_recv1),
         send2_row=_block_to_end(plan.send2_row, recv_lo, recv_hi, num_recv1),
         pilot_row=_block_to_end(plan.pilot_row, recv_lo, recv_hi, num_recv1),

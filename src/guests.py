@@ -9,7 +9,9 @@ Three steps, each one function or class here:
 
     1. remote_demand(): how often this rank's tokens ask for each expert of another
        node. The routing can be the layer's own, a recording, or a prediction.
-    2. choose_guests(): the experts with the most demand become guests. Two placements:
+    2. choose_guests(): the experts with the most demand become guests.
+       choose_guests_by_pilots() takes the experts that keep the most pilots alive
+       instead. Two placements:
            unique: the ranks of a node add up their demand and deal the node's
                slots * G hottest experts over themselves, so no two ranks of a node
                load the same expert, and a token uses any guest on its node.
@@ -40,7 +42,10 @@ from typing import NamedTuple
 import torch
 import torch.distributed as dist
 
-__all__ = ["Guests", "remote_demand", "choose_guests", "no_guests", "home_ids", "GuestPool"]
+__all__ = [
+    "Guests", "remote_demand", "choose_guests", "pilot_credit", "choose_guests_by_pilots",
+    "no_guests", "home_ids", "GuestPool",
+]
 
 
 class Guests(NamedTuple):
@@ -124,26 +129,129 @@ def choose_guests(
     Returns:
         guests: This rank's slots and the id that serves every expert for its tokens.
     """
-    world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
-    E, G, device = demand.numel(), gpus_per_node, demand.device
-    L = E // world
-    first, seats = rank, slots
+    E, seats = demand.numel(), slots
     if local_group is not None:
         demand = demand.clone()
         dist.all_reduce(demand, group=local_group)
-        first, seats = rank // G * G, slots * G
+        seats = slots * gpus_per_node
 
     # Hottest first; E - 1 - e breaks ties the same way on every rank.
-    key = demand * E + (E - 1 - torch.arange(E, device=device))
+    key = demand * E + (E - 1 - torch.arange(E, device=demand.device))
     hot = key.topk(seats).indices
     hot = torch.where(demand[hot] > 0, hot, -1)
-    seat = torch.arange(seats, device=device)
+    return _deal(hot, E, slots, gpus_per_node, ep_group)
+
+
+def _deal(
+    hot: torch.Tensor,
+    num_experts: int,
+    slots: int,
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None,
+) -> Guests:
+    """Seat chosen experts in guest slots: a node's list over its ranks in turn, or a rank's own.
+
+    Args:
+        hot: [slots * G] experts chosen for this rank's node, the same on all its
+            ranks, or [slots] experts chosen for this rank alone; -1 leaves a slot empty.
+
+    Returns:
+        guests: This rank's slots and the id that serves every expert for its tokens.
+    """
+    world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
+    E, L, seats = num_experts, num_experts // world, hot.numel()
+    first = rank // gpus_per_node * gpus_per_node if seats > slots else rank
+    seat = torch.arange(seats, device=hot.device)
     holder = first + seat % (seats // slots)
     seat_id = holder * (L + slots) + L + seat // (seats // slots)
 
-    grown = torch.cat([_home_ids(E, world, slots, device), seat_id.new_empty(1)])
+    grown = torch.cat([_home_ids(E, world, slots, hot.device), seat_id.new_empty(1)])
     grown[torch.where(hot >= 0, hot, E)] = seat_id
     return Guests(hot[rank - first :: seats // slots], grown[:E], world * (L + slots))
+
+
+def pilot_credit(
+    route: torch.Tensor,
+    num_experts: int,
+    node: int,
+    num_nodes: int,
+    taken: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score every expert of another node by the pilots a guest of it would help remove.
+
+    A copy that leaves the node counts 1 / r for its expert, where r is how many of its
+    token's copies leave for the same node. All r must become guests before that pilot
+    disappears, so a pilot's credit is split over the experts that keep it alive, and
+    the credits of a routing add up to its pilots.
+
+    Args:
+        route: [num_tokens, k] experts each token is routed to.
+        num_experts: Total number of experts, E.
+        node: This rank's node.
+        num_nodes: Nodes holding the experts, in contiguous blocks of E // num_nodes.
+        taken: [E] bool experts that are guests already, whose copies stay on the node.
+
+    Returns:
+        credit: [E] float; 0 for the experts of this node and the taken ones.
+    """
+    route = route.long()
+    dest = route // (num_experts // num_nodes)
+    leaving = dest != node
+    if taken is not None:
+        leaving = leaving & ~taken[route]
+    together = (dest.unsqueeze(2) == dest.unsqueeze(1)) & leaving.unsqueeze(1)
+    credit = torch.zeros(num_experts, device=route.device)
+    credit.scatter_add_(0, route.flatten(), (leaving / together.sum(dim=2).clamp_min(1)).flatten())
+    return credit
+
+
+def choose_guests_by_pilots(
+    route: torch.Tensor,
+    num_experts: int,
+    slots: int,
+    gpus_per_node: int,
+    local_group: dist.ProcessGroup | None = None,
+    ep_group: dist.ProcessGroup | None = None,
+    rounds: int = 4,
+) -> Guests:
+    """Make guests of the experts whose copies keep the most pilots alive.
+
+    choose_guests() takes the experts in most demand, which removes the most copies.
+    RBD sends pilots, not copies, and a pilot goes only when every copy behind it has a
+    guest. This takes the guests in `rounds` equal batches by pilot_credit(), counting
+    the guests of earlier batches as taken, so later batches finish the pilots that
+    earlier ones opened. One round is a single weighted count; slots * G rounds add one
+    guest at a time. Placements and collectives are those of choose_guests(), with one
+    all_reduce over local_group per round.
+
+    Args:
+        route: [num_tokens, k] experts each of this rank's tokens is routed to.
+        num_experts: Total number of experts, E.
+        slots: Guests per rank.
+        gpus_per_node: Ranks per node, G.
+        local_group: Process group of this rank's node, or None for redundant guests.
+        ep_group: Process group holding the experts. None means the global group.
+        rounds: Batches to take the guests in.
+
+    Returns:
+        guests: This rank's slots and the id that serves every expert for its tokens.
+    """
+    world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
+    E, G = num_experts, gpus_per_node
+    seats = slots * G if local_group is not None else slots
+    taken = torch.zeros(E + 1, dtype=torch.bool, device=route.device)
+    hot = []
+    for i in range(rounds):
+        credit = pilot_credit(route, E, rank // G, world // G, taken[:E])
+        if local_group is not None:
+            dist.all_reduce(credit, group=local_group)
+        # A stable sort breaks ties the same way on every rank of the node.
+        best = credit.argsort(descending=True, stable=True)
+        best = best[: seats * (i + 1) // rounds - seats * i // rounds]
+        best = torch.where(credit[best] > 0, best, -1)
+        taken[torch.where(best >= 0, best, E)] = True
+        hot.append(best)
+    return _deal(torch.cat(hot), E, slots, G, ep_group)
 
 
 def home_ids(

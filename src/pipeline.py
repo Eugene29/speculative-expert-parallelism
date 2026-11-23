@@ -16,8 +16,9 @@ Two versions:
         (spec_ep.rbd.start_plans): one exchange and one host sync for all of them. The
         dispatches start as soon as the stage 1 rows are known, and the host-bound rest
         of the plan (finish_plans) runs while they are on the network. Only the stage 1
-        all2alls over ep_group are started ahead. A slice's stage 2 over local_group
-        and its experts run under the next slice's stage 1.
+        all2alls are started ahead. A slice's stage 2 over local_group and its experts
+        run under the next slice's stage 1. With lanes=2 every slice's stage 1 goes in
+        the two lanes of spec_ep.two_lane.
     pipelined_plain_combine_dispatch: one row per (token, expert). Each slice is
         planned on its own, as spec_ep.plain plans a layer, so planning costs `degree`
         times its exchanges and host syncs.
@@ -32,6 +33,7 @@ Usage:
     python -m pytest tests/test_pipeline.py -v
 """
 from collections.abc import Callable
+from functools import partial
 from typing import NamedTuple
 
 import torch
@@ -40,6 +42,7 @@ from torch.profiler import record_function
 
 from spec_ep.ops import all2all, all2all_async, gather_sum
 from spec_ep.rbd import finish_plans, stage2_combine, stage2_dispatch, start_plans, token_slices
+from spec_ep.two_lane import pilots_first, two_lane_all2all_async, two_lane_plan
 
 __all__ = ["pipelined_rbd_combine_dispatch", "pipelined_plain_combine_dispatch"]
 
@@ -55,6 +58,7 @@ def pipelined_rbd_combine_dispatch(
     degree: int,
     ep_group: dist.ProcessGroup | None = None,
     pilot_rule: str = "rail",
+    lanes: int = 1,
 ) -> torch.Tensor:
     """Dispatch tokens, run the experts, and combine through RBD, pipelined in slices.
 
@@ -66,6 +70,9 @@ def pipelined_rbd_combine_dispatch(
     Args:
         expert: As in rbd_combine_dispatch(). Called once per slice.
         degree: Slices to cut this rank's tokens into.
+        lanes: 1 sends a slice's stage 1 rows in one all2all over ep_group. 2 sends
+            them as spec_ep.two_lane does: pilots over ep_group, direct rows over
+            local_group.
 
     Returns:
         output: [num_tokens, H] weighted sum of each token's expert outputs, in input
@@ -76,14 +83,26 @@ def pipelined_rbd_combine_dispatch(
         start = start_plans(
             route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree
         )
+    send1_token, start_all2all = start.send1_token, partial(all2all_async, group=ep_group)
+    if lanes == 2:
+        send1_token = [
+            pilots_first(token, send, gpus_per_node, ep_group)
+            for token, send in zip(send1_token, start.send1)
+        ]
+        start_all2all = partial(
+            two_lane_all2all_async,
+            gpus_per_node=gpus_per_node, local_group=local_group, ep_group=ep_group,
+        )
     with record_function("autoep/rbd_stage1_dispatch"):
         arriving = [
-            all2all_async(tokens[s][token], send, recv, ep_group)
-            for s, token, send, recv in zip(slices, start.send1_token, start.send1, start.recv1)
+            start_all2all(tokens[s][token], send, recv)
+            for s, token, send, recv in zip(slices, send1_token, start.send1, start.recv1)
         ]
     # The rest of the plan is host work, so it runs under the dispatches.
     with record_function("autoep/rbd_plan"):
         plans = finish_plans(start)
+        if lanes == 2:
+            plans = [two_lane_plan(plan, gpus_per_node, ep_group) for plan in plans]
 
     returning = []
     for plan, wait in zip(plans, arriving):
@@ -94,7 +113,7 @@ def pipelined_rbd_combine_dispatch(
             outputs = expert(expert_inputs, plan.expert_ids)
         back = stage2_combine(outputs, plan, local_group)
         with record_function("autoep/rbd_stage1_combine"):
-            returning.append(all2all_async(back, plan.recv1, plan.send1, ep_group))
+            returning.append(start_all2all(back, plan.recv1, plan.send1))
 
     output = tokens.new_empty(tokens.shape)
     for s, plan, wait in zip(slices, plans, returning):

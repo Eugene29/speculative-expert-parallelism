@@ -39,9 +39,12 @@ def _plain_pipeline(
 
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_pipelines_match_local_reference(tmp_path: Path, layout: Layout) -> None:
-    """Both pipelines give the locally computed answer on every rank, for every degree."""
+    """Every pipeline gives the locally computed answer on every rank, for every degree."""
     variants = {}
     for degree in DEGREES:
         variants[f"rbd degree={degree}"] = partial(pipelined_rbd_combine_dispatch, degree=degree)
+        variants[f"rbd two lanes degree={degree}"] = partial(
+            pipelined_rbd_combine_dispatch, degree=degree, lanes=2
+        )
         variants[f"plain degree={degree}"] = partial(_plain_pipeline, degree=degree)
     run_check(tmp_path, layout, variants)

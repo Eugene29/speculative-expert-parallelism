@@ -1,7 +1,7 @@
 """Time inference of the MoE model under every dispatch mode, and optionally record its routing.
 
 Loads Qwen3.6-35B-A3B on CPU, lets DeepSpeed's AutoEP spread the experts over the
-ranks, and runs a prefill forward on --seq-len tokens per rank cut from
+ranks, and runs a prefill forward on --sequences sequences of --seq-len tokens per rank, cut from
 data/short_text.txt. The model is loaded once. --modes then picks how every MoE layer
 dispatches and combines: autoep is the layer's own path, and any other mode of
 benchmark/all2all/modes.py (rbd, two_lane, tutel:capacity_factor=1, ds_moe, xmoe, ...)
@@ -194,16 +194,17 @@ def get_batch(
     model_id: str,
     dev: torch.device,
     seq_len: int,
+    sequences: int = 1,
     text_path: str = "data/short_text.txt",
     skip: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Cut this rank's seq_len tokens from a text file, after its first skip tokens.
+    """Cut this rank's sequences of seq_len tokens from a text file, after its first skip tokens.
 
-    Rank r gets tokens skip + r * seq_len to skip + (r + 1) * seq_len, so no two ranks
-    share any.
+    Rank r gets the sequences * seq_len tokens that start at token
+    skip + r * sequences * seq_len, so no two ranks share any.
 
     Returns:
-        batch: input_ids and attention_mask, each [1, seq_len].
+        batch: input_ids and attention_mask, each [sequences, seq_len].
     """
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
@@ -216,15 +217,16 @@ def get_batch(
         return_tensors="pt",
     )
 
-    strt, end = skip + rank*seq_len, skip + (rank+1)*seq_len
+    needed = sequences * seq_len
+    strt, end = skip + rank * needed, skip + (rank + 1) * needed
 
-    if tokens.input_ids[:, strt:end].shape[1] < seq_len:
-        raise ValueError(f"Provide more text: at least {seq_len} tokens are required. "
+    if tokens.input_ids[:, strt:end].shape[1] < needed:
+        raise ValueError(f"Provide more text: at least {needed} tokens are required. "
                          f"[{rank}] has {tokens.input_ids[:, strt:end].shape[1]} seq.")
 
     batch = {
-        "input_ids": tokens.input_ids[:, strt:end].to(dev),
-        "attention_mask": tokens.attention_mask[:, strt:end].to(dev),
+        "input_ids": tokens.input_ids[0, strt:end].view(sequences, seq_len).to(dev),
+        "attention_mask": tokens.attention_mask[0, strt:end].view(sequences, seq_len).to(dev),
     }
 
     return batch
@@ -453,7 +455,8 @@ def parse_args() -> argparse.Namespace:
                         help="Path to the DeepSpeed config (e.g. configs/qwen_ep4.json)")
     parser.add_argument("--model", type=str, default="/pscratch/sd/e/eku/spec_ep/models/Qwen3.6-35B-A3B",
                         help="Model directory; must be a qwen3_5_moe checkpoint")
-    parser.add_argument("--seq-len", type=int, default=4096, help="Tokens per rank")
+    parser.add_argument("--seq-len", type=int, default=4096, help="Tokens per sequence")
+    parser.add_argument("--sequences", type=int, default=1, help="Sequences per rank")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"],
                         help="float32 shows whether two modes compute the same function: bf16 "
                              "rounding differs between merge kernels and grows through the layers")
@@ -493,7 +496,7 @@ def main() -> None:
     # Guests load from host memory, so the experts of other nodes are kept there.
     with keep_remote_experts(args.gpus_per_node) if guest_settings else contextlib.nullcontext() as store:
         engine = init_deepspeed(model, args.config_pth)
-    batch = get_batch(model_id, engine.device, seq_len)
+    batch = get_batch(model_id, engine.device, seq_len, args.sequences)
 
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
     layer = layers[0]
@@ -513,8 +516,8 @@ def main() -> None:
         if args.record:
             torch.save(routing["oracle"], logs / f"experts_rank{rank}.pt")
         if "static" in sources:
-            history = get_batch(model_id, engine.device, seq_len, args.history_text,
-                                args.history_skip)
+            history = get_batch(model_id, engine.device, seq_len, args.sequences,
+                                args.history_text, args.history_skip)
             routing["static"] = record_expert_routing(engine, history)
 
         modes = {}
@@ -573,7 +576,7 @@ def main() -> None:
                         write_trace(logs / "events" / f"{spec}_rank{rank}.json", events, rank,
                                     lambda event: dict(zip(("scope", "layer"), scope(event))))
         medians = {spec: statistics.median(s) for spec, s in calls.items()}
-        print0(f"{args.repeats} rounds x 1 timed forward per mode, {seq_len} tokens per rank:")
+        print0(f"{args.repeats} rounds x 1 timed forward per mode, {args.sequences} x {seq_len} tokens per rank:")
         for spec, s in calls.items():
             print0(f"{spec:>{width}}: median {medians[spec]:7.3f} s | min {min(s):7.3f} | "
                    f"max {max(s):7.3f} | {medians[first] / medians[spec]:.2f}x vs {first}")
