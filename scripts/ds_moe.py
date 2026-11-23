@@ -7,12 +7,15 @@ dispatches and combines: autoep is the layer's own path, and any other mode of
 benchmark/all2all/modes.py (rbd, two_lane, tutel:capacity_factor=1, ds_moe, xmoe, ...)
 replaces it with that mode's function, the same one the layer benchmark times.
 rbd_guests is built here (scripts/ds_guests.py): RBD in which every rank also runs the
-hottest experts of other nodes, loaded from host memory one layer ahead. Its settings
-are slots (guests per rank), source (speculative, static or oracle), placement (unique
-or redundant), lanes (2 for two-lane RBD, 1 for RBD in one all2all) and degree (slices
-of the one-lane RBD pipeline), as in rbd_guests:slots=16,source=static. After its
-first forward it prints how its guests compare with the oracle's and what loading them
-took (GuestDispatch.measure).
+hottest experts of other nodes, pulled from their owners' GPUs one layer ahead into
+slots all layers share. Its settings are slots (guests per rank), source (speculative,
+static or oracle), placement (unique or redundant), choice (demand or pilots), balance
+and lanes (2 for two-lane RBD, 1 for RBD in one all2all), as in
+rbd_guests:slots=8,source=static. After its first forward it prints how its guests
+compare with the oracle's and what pulling them took (GuestDispatch.measure).
+
+The default model is Qwen3.6-35B-A3B. The target workload is Qwen3.5-397B-A17B, which
+needs 16 GPUs of 80 GB; --layers 30 times its first half on 8.
 
 For every mode the script first runs one untimed forward. It prints how far the
 forward's last logits are from the first mode's, on how many of the last tokens both
@@ -102,7 +105,7 @@ from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 from benchmark.all2all.modes import MODES, Mode, build_mode, parse_mode
 from spec_ep.phase_clock import Event, PhaseClock, Totals, totals, write_trace
 
-from ds_guests import GuestDispatch, check_store, keep_remote_experts
+from ds_guests import GuestDispatch
 from ds_utils import (
     add_expert_statistics_hook,
     count_params,
@@ -185,15 +188,9 @@ def init_deepspeed(
 def set_mode(engine: deepspeed.DeepSpeedEngine, mode: Mode | GuestDispatch | None) -> None:
     """Make every AutoEP layer dispatch and combine through mode; None is its own path.
 
-    A GuestDispatch gives every layer its own function and grows the layers' weights
-    by its guest rows, which it does here and undoes when another mode is set.
+    A GuestDispatch gives every layer its own function.
     """
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
-    previous = getattr(getattr(layers[0].combine_dispatch, "func", None), "__self__", None)
-    if isinstance(previous, GuestDispatch):
-        previous.release()
-    if isinstance(mode, GuestDispatch):
-        mode.acquire()
     for i, layer in enumerate(layers):
         layer.combine_dispatch = mode.for_layer(i) if isinstance(mode, GuestDispatch) else mode
 
@@ -503,21 +500,14 @@ def main() -> None:
     sources = {settings.get("source", "speculative") for settings in guest_settings.values()}
 
     model = load_model(model_id, getattr(torch, args.dtype), args.layers)
-    # Guests load from host memory, so the experts of other nodes are kept there: the
-    # one in gpus_per_node a rank can host, or all of them if a mode has redundant guests.
-    redundant = any(s.get("placement") == "redundant" for s in guest_settings.values())
-    keep = keep_remote_experts(args.gpus_per_node, 1 if redundant else args.gpus_per_node)
-    with keep if guest_settings else contextlib.nullcontext() as store:
-        engine = init_deepspeed(model, args.config_pth)
+    engine = init_deepspeed(model, args.config_pth)
     batch = get_batch(model_id, engine.device, seq_len, args.sequences)
 
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
     layer = layers[0]
-    if guest_settings:
-        check_store(layers, store, args.gpus_per_node)
-        print0(f"guest store: {len(store)} layers x {store[0][0].shape[0]} experts of other nodes "
-               f"per rank, each checked against its owner")
     local_group, _ = torch.distributed.new_subgroups(group_size=args.gpus_per_node)
+    # Guest weights travel on a communicator of their own, under a layer's all2alls.
+    fetch_group = torch.distributed.new_group(list(range(world_size))) if guest_settings else None
     width = max(map(len, args.modes))
 
     with torch.inference_mode():
@@ -538,7 +528,7 @@ def main() -> None:
             if spec in guest_settings:
                 settings = guest_settings[spec]
                 modes[spec] = GuestDispatch(
-                    layers, store, args.gpus_per_node, local_group, **settings,
+                    layers, args.gpus_per_node, local_group, fetch_group, **settings,
                     routing=routing.get(settings.get("source", "speculative")),
                 )
             elif spec != "autoep":
