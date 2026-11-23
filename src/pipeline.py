@@ -40,20 +40,9 @@ import torch.distributed as dist
 from torch.profiler import record_function
 
 from spec_ep.ops import all2all, all2all_async, gather_sum
-from spec_ep.rbd import make_plan, stage2_combine, stage2_dispatch
+from spec_ep.rbd import make_plans, stage2_combine, stage2_dispatch, token_slices
 
 __all__ = ["pipelined_rbd_combine_dispatch", "pipelined_plain_combine_dispatch"]
-
-
-def _slices(num_tokens: int, degree: int) -> list[slice]:
-    """Cut num_tokens tokens into degree contiguous slices of near-equal size.
-
-    Returns:
-        slices: Slice c is tokens num_tokens * c // degree up to
-            num_tokens * (c + 1) // degree.
-    """
-    bounds = [num_tokens * c // degree for c in range(degree + 1)]
-    return [slice(a, b) for a, b in zip(bounds, bounds[1:])]
 
 
 def pipelined_rbd_combine_dispatch(
@@ -83,17 +72,16 @@ def pipelined_rbd_combine_dispatch(
         output: [num_tokens, H] weighted sum of each token's expert outputs, in input
             order.
     """
-    slices = _slices(tokens.shape[0], degree)
-    plans, arriving = [], []
-    for s in slices:
-        with record_function("autoep/rbd_plan"):
-            plan = make_plan(
-                route[s], weights[s], num_experts, gpus_per_node, ep_group, pilot_rule
-            )
-        with record_function("autoep/rbd_stage1_dispatch"):
-            rows = tokens[s][plan.send1_token]
-            arriving.append(all2all_async(rows, plan.send1, plan.recv1, ep_group))
-        plans.append(plan)
+    slices = token_slices(tokens.shape[0], degree)
+    with record_function("autoep/rbd_plan"):
+        plans = make_plans(
+            route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree
+        )
+    with record_function("autoep/rbd_stage1_dispatch"):
+        arriving = [
+            all2all_async(tokens[s][plan.send1_token], plan.send1, plan.recv1, ep_group)
+            for s, plan in zip(slices, plans)
+        ]
 
     returning = []
     for plan, wait in zip(plans, arriving):
@@ -177,7 +165,7 @@ def pipelined_plain_combine_dispatch(
         output: [num_tokens, H] weighted sum of each token's expert outputs, in input
             order.
     """
-    slices = _slices(tokens.shape[0], degree)
+    slices = token_slices(tokens.shape[0], degree)
     plans, arriving = [], []
     for s in slices:
         with record_function("plain/plan"):

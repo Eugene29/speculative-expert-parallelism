@@ -46,6 +46,8 @@ from spec_ep.ops import all2all, gather_sum
 __all__ = [
     "PILOT_RULES",
     "Plan",
+    "token_slices",
+    "make_plans",
     "make_plan",
     "stage1_dispatch",
     "stage2_dispatch",
@@ -199,21 +201,35 @@ def _send_pilot_meta(
     return meta[:, :k], meta[:, k:].view(torch.float32)
 
 
-def make_plan(
+def token_slices(num_tokens: int, degree: int) -> list[slice]:
+    """Cut num_tokens tokens into degree contiguous slices of near-equal size.
+
+    Returns:
+        slices: Slice c is tokens num_tokens * c // degree up to
+            num_tokens * (c + 1) // degree.
+    """
+    bounds = [num_tokens * c // degree for c in range(degree + 1)]
+    return [slice(a, b) for a, b in zip(bounds, bounds[1:])]
+
+
+def make_plans(
     route: torch.Tensor,
     weights: torch.Tensor,
     num_experts: int,
     gpus_per_node: int,
     ep_group: dist.ProcessGroup | None = None,
     pilot_rule: str = "rail",
-) -> Plan:
-    """Decide where every row goes and tell the receiving ranks. Sends no tokens.
+    degree: int = 1,
+) -> list[Plan]:
+    """Plan every slice of token_slices(num_tokens, degree) at once. Sends no tokens.
 
-    Collective over ep_group, with a single host sync to read every split size.
-    The arguments are those of rbd_combine_dispatch().
+    Collective over ep_group. The slices share one exchange of counts and one host
+    sync, which reads the split sizes of all of them: the counts get one block of
+    columns per slice. Each slice then costs only its small all2all of pilot metadata,
+    which never waits for the host. The arguments are those of rbd_combine_dispatch().
 
     Returns:
-        plan: The indices, split sizes and weights the five stages need.
+        plans: One Plan per slice, each as if its tokens were a layer of their own.
     """
     world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
     G, L = gpus_per_node, num_experts // world
@@ -237,42 +253,106 @@ def make_plan(
         expert_rank, expert_node, same, pilot_slot, rank, G, pilot_rule, pilot_offset
     )
 
+    # Columns of one slice's counts: a row per expert, the pilots, then stage 2.
     pilot_column = L
     stage2_send_start = pilot_column + 1
     stage2_recv_start = stage2_send_start + G
     C = stage2_recv_start + G * L
-    unused = world * C
+    slices = token_slices(num_tokens, degree)
+    lengths = torch.tensor([s.stop - s.start for s in slices], device=device)
+    token_slice = torch.arange(degree, device=device).repeat_interleave(lengths, output_size=num_tokens)
+    first_column = (token_slice * C).unsqueeze(1)
+    unused = world * degree * C
     stage1 = torch.where(
         direct,
-        expert_rank * C + local_expert,
-        torch.where(is_pilot, pilot_rank * C + pilot_column, unused),
+        expert_rank * degree * C + first_column + local_expert,
+        torch.where(is_pilot, pilot_rank * degree * C + first_column + pilot_column, unused),
     )
-    to_pilot = torch.where(~direct, pilot_rank * C + stage2_send_start + expert_rank % G, unused)
+    to_pilot = torch.where(
+        ~direct,
+        pilot_rank * degree * C + first_column + stage2_send_start + expert_rank % G,
+        unused,
+    )
     to_expert = torch.where(
         ~direct,
-        expert_rank * C + stage2_recv_start + (pilot_rank % G) * L + local_expert,
+        expert_rank * degree * C + first_column + stage2_recv_start
+        + (pilot_rank % G) * L + local_expert,
         unused,
     )
     slots = torch.cat([stage1.flatten(), to_pilot.flatten(), to_expert.flatten()])
-    counts, recv_counts = _exchange_counts(slots, world, C, ep_group)
+    counts, recv_counts = _exchange_counts(slots, world, degree * C, ep_group)
+    counts, recv_counts = counts.view(world, degree, C), recv_counts.view(world, degree, C)
 
-    stage2_in = recv_counts[:, stage2_recv_start:].view(world, G, L).sum(dim=0)
+    stage2_in = recv_counts[:, :, stage2_recv_start:].view(world, degree, G, L).sum(dim=0)
     sizes = torch.cat(
         [
-            counts[:, :stage2_send_start].sum(dim=1),
-            recv_counts[:, :stage2_send_start].sum(dim=1),
-            counts[:, pilot_column],
-            recv_counts[:, pilot_column],
-            recv_counts[:, stage2_send_start:stage2_recv_start].sum(dim=0),
-            stage2_in.sum(dim=1),
-        ]
+            counts[:, :, :stage2_send_start].sum(dim=2).T,
+            recv_counts[:, :, :stage2_send_start].sum(dim=2).T,
+            counts[:, :, pilot_column].T,
+            recv_counts[:, :, pilot_column].T,
+            recv_counts[:, :, stage2_send_start:stage2_recv_start].sum(dim=0),
+            stage2_in.sum(dim=2),
+        ],
+        dim=1,
     ).tolist()
+
+    stage1_key = torch.where(
+        direct,
+        expert_rank * (L + 1) + local_expert,
+        torch.where(is_pilot, pilot_rank * (L + 1) + pilot_column, world * (L + 1)),
+    )
+    node_expert = (expert_rank % G) * L + local_expert
+    return [
+        _finish_plan(
+            sizes[c], stage1_key[s], same[s], node_expert[s], weights[s], direct[s],
+            is_pilot[s], recv_counts[:, c, :L], stage2_in[c], rank, G, ep_group,
+        )
+        for c, s in enumerate(slices)
+    ]
+
+
+def _finish_plan(
+    sizes: list[int],
+    stage1_key: torch.Tensor,
+    same: torch.Tensor,
+    node_expert: torch.Tensor,
+    weights: torch.Tensor,
+    direct: torch.Tensor,
+    is_pilot: torch.Tensor,
+    direct_in: torch.Tensor,
+    stage2_in: torch.Tensor,
+    rank: int,
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None,
+) -> Plan:
+    """Build one slice's Plan from its split sizes. Collective; no host sync.
+
+    Args:
+        sizes: The slice's send1, recv1, pilot_send and pilot_recv per rank of
+            ep_group, then send2 and recv2 per rank of the node.
+        stage1_key: [num_tokens, k] sort key of each copy's stage 1 row: destination
+            rank, then expert, with pilots after a rank's experts; past every rank
+            for copies that send no row.
+        same: [num_tokens, k, k] whether two copies of a token share a node.
+        node_expert: [num_tokens, k] each copy's expert, numbered within its node.
+        direct: [num_tokens, k] whether the copy's expert is on this node.
+        is_pilot: [num_tokens, k] whether the copy is its node's pilot.
+        direct_in: [world, L] direct rows each rank sends to each expert here.
+        stage2_in: [G, L] stage 2 rows each rank of the node sends to each expert here.
+
+    Returns:
+        plan: The slice's indices, split sizes and weights.
+    """
+    world, G = direct_in.shape[0], gpus_per_node
+    L = direct_in.shape[1]
+    node = rank // G
+    num_tokens, k = stage1_key.shape
+    device = stage1_key.device
     send1, recv1 = sizes[:world], sizes[world : 2 * world]
     pilot_send, pilot_recv = sizes[2 * world : 3 * world], sizes[3 * world : 4 * world]
     send2, recv2 = sizes[4 * world : 4 * world + G], sizes[4 * world + G :]
 
     num_send1 = sum(send1)
-    stage1_key = torch.where(stage1 < unused, stage1 // C * (L + 1) + stage1 % C, unused)
     order = stage1_key.flatten().sort(stable=True).indices
     sent = order[:num_send1]
 
@@ -286,7 +366,7 @@ def make_plan(
     copy_expert, merge_weight = _send_pilot_meta(
         pilot_copy,
         same.view(-1, k)[pilot_copy],
-        (expert_rank % G) * L + local_expert,
+        node_expert,
         weights,
         pilot_send,
         pilot_recv,
@@ -306,7 +386,7 @@ def make_plan(
 
     expert_ids = torch.cat(
         [
-            _expert_ids(recv_counts[lo:hi, :L], rank * L, num_direct),
+            _expert_ids(direct_in[lo:hi], rank * L, num_direct),
             _expert_ids(stage2_in, rank * L, sum(recv2)),
         ]
     )
@@ -332,6 +412,25 @@ def make_plan(
         final_index=final_index,
         final_weight=final_weight,
     )
+
+
+def make_plan(
+    route: torch.Tensor,
+    weights: torch.Tensor,
+    num_experts: int,
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None = None,
+    pilot_rule: str = "rail",
+) -> Plan:
+    """Decide where every row goes and tell the receiving ranks. Sends no tokens.
+
+    Collective over ep_group, with a single host sync to read every split size.
+    The arguments are those of rbd_combine_dispatch().
+
+    Returns:
+        plan: The indices, split sizes and weights the five stages need.
+    """
+    return make_plans(route, weights, num_experts, gpus_per_node, ep_group, pilot_rule)[0]
 
 
 def stage1_dispatch(
