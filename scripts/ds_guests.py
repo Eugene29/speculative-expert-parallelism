@@ -67,7 +67,7 @@ Store = list[list[torch.Tensor]]  # per MoE layer: w1, w2, w3 of the other nodes
 
 
 @contextlib.contextmanager
-def keep_remote_experts(gpus_per_node: int) -> Iterator[Store]:
+def keep_remote_experts(gpus_per_node: int, stripe: int = 1) -> Iterator[Store]:
     """Keep the other nodes' experts in pinned host memory while AutoEP builds its layers.
 
     AutoEP copies a rank's own experts out of the source model and drops the rest. For
@@ -75,9 +75,14 @@ def keep_remote_experts(gpus_per_node: int) -> Iterator[Store]:
     node, in expert order, into page-locked memory, which a GPU loads from several
     times faster than from ordinary memory.
 
+    Args:
+        stripe: Keep one expert in `stripe`: those with e % stripe == rank % stripe.
+            Unique guests need stripe = gpus_per_node, since a rank hosts no others,
+            and the store is that many times smaller. Redundant guests need 1.
+
     Yields:
         store: Filled as the layers are built: store[i] holds w1, w2 and w3 of MoE
-            layer i, each [E - experts per node, ...].
+            layer i, each [(E - experts per node) / stripe, ...].
     """
     repack = auto_ep_layer.repack_expert_weights
     store: Store = []
@@ -85,7 +90,9 @@ def keep_remote_experts(gpus_per_node: int) -> Iterator[Store]:
     def repack_and_keep(experts_source, spec, ep_rank: int, ep_size: int) -> tuple[torch.Tensor, ...]:
         node, num_nodes = ep_rank // gpus_per_node, ep_size // gpus_per_node
         others = [repack(experts_source, spec, n, num_nodes) for n in range(num_nodes) if n != node]
-        store.append([torch.cat(parts).pin_memory() for parts in zip(*others)])
+        store.append([
+            torch.cat(parts)[ep_rank % stripe :: stripe].pin_memory() for parts in zip(*others)
+        ])
         return repack(experts_source, spec, ep_rank, ep_size)
 
     auto_ep_layer.repack_expert_weights = repack_and_keep
@@ -122,6 +129,8 @@ def check_store(
     remote = torch.ones(truth.shape[2], dtype=torch.bool)
     remote[rank // gpus_per_node * per_node :][:per_node] = False
     kept = torch.stack([torch.stack([energy(w) for w in weights]) for weights in store])
+    stripe = int(remote.sum()) // kept.shape[2]
+    remote &= torch.arange(remote.numel()) % stripe == rank % stripe
     wrong = ((kept - truth[:, :, remote]).abs() > 1e-5 * kept).any(dim=1).sum().item()
     if wrong:
         raise RuntimeError(f"rank {rank}: {wrong} stored experts differ from their owner's weights.")
@@ -238,7 +247,8 @@ class GuestDispatch:
         """
         per_node = self.L * self.G
         first = self.rank // self.G * per_node
-        return [e if e < first else e - per_node for e in slot_expert.tolist()]
+        stripe = (self.E - per_node) // self.store[0][0].shape[0]
+        return [(e if e < first else e - per_node) // stripe for e in slot_expert.tolist()]
 
     def _dispatch(
         self,

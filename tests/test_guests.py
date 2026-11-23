@@ -74,6 +74,7 @@ def _with_guests(
         dist.all_gather_into_tensor(node_slots, guests.slot_expert, group=local_group)
         node_held = node_slots[node_slots >= 0]
         assert node_held.unique().numel() == node_held.numel(), "two ranks hold one guest"
+        assert (held % G == rank % G).all(), "a guest from another rank's stripe"
     else:
         assert (served_by[moved] == rank).all(), "a copy moved to another rank's guest"
         assert moved.any() == (demand.sum() > 0), "demand for other nodes but no copy moved"

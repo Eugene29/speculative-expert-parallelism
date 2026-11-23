@@ -119,6 +119,7 @@ from ds_utils import (
 )
 
 logs = Path(os.environ["LOGS"])
+logs.mkdir(parents=True, exist_ok=True)
 LAYER = "moe/layer"  # the span around MoE layer i is called moe/layer{i}
 GUESTS = "rbd_guests"  # the one mode built here, not by benchmark/all2all/modes.py
 Row = tuple[str, str, str, str]  # scope, step, category and link of one row of the events table
@@ -493,8 +494,11 @@ def main() -> None:
     sources = {settings.get("source", "speculative") for settings in guest_settings.values()}
 
     model = load_model(model_id, getattr(torch, args.dtype))
-    # Guests load from host memory, so the experts of other nodes are kept there.
-    with keep_remote_experts(args.gpus_per_node) if guest_settings else contextlib.nullcontext() as store:
+    # Guests load from host memory, so the experts of other nodes are kept there: the
+    # one in gpus_per_node a rank can host, or all of them if a mode has redundant guests.
+    redundant = any(s.get("placement") == "redundant" for s in guest_settings.values())
+    keep = keep_remote_experts(args.gpus_per_node, 1 if redundant else args.gpus_per_node)
+    with keep if guest_settings else contextlib.nullcontext() as store:
         engine = init_deepspeed(model, args.config_pth)
     batch = get_batch(model_id, engine.device, seq_len, args.sequences)
 

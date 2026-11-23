@@ -12,9 +12,11 @@ Three steps, each one function or class here:
     2. choose_guests(): the experts with the most demand become guests.
        choose_guests_by_pilots() takes the experts that keep the most pilots alive
        instead. Two placements:
-           unique: the ranks of a node add up their demand and deal the node's
-               slots * G hottest experts over themselves, so no two ranks of a node
-               load the same expert, and a token uses any guest on its node.
+           unique: the ranks of a node add up their demand, and the node's rank q
+               takes the slots hottest experts e with e % G == q. No two ranks of a
+               node load the same expert, a token uses any guest on its node, and a
+               rank only ever hosts one expert in G of the other nodes, so that is
+               all its host memory has to hold.
            redundant: every rank loads its own slots hottest experts and only its own
                tokens use them. No collective, and a guest row never leaves its rank,
                but two ranks of a node may load the same expert.
@@ -113,8 +115,8 @@ def choose_guests(
     """Make the experts in most demand this rank's guests.
 
     With local_group the placement is unique and the call is collective over it: the
-    node's demand is the sum over its ranks, and the node's slots * G hottest experts
-    are dealt over the ranks in turn. Without it the placement is redundant and the
+    node's demand is the sum over its ranks, and the node's rank q takes the slots
+    hottest experts e with e % G == q. Without it the placement is redundant and the
     call is local: this rank takes its own slots hottest experts. An expert nobody
     asks for is never a guest, so slots can stay empty. Ties go to the lower expert id,
     which keeps the ranks of a node in agreement.
@@ -129,17 +131,25 @@ def choose_guests(
     Returns:
         guests: This rank's slots and the id that serves every expert for its tokens.
     """
-    E, seats = demand.numel(), slots
     if local_group is not None:
         demand = demand.clone()
         dist.all_reduce(demand, group=local_group)
-        seats = slots * gpus_per_node
-
-    # Hottest first; E - 1 - e breaks ties the same way on every rank.
-    key = demand * E + (E - 1 - torch.arange(E, device=demand.device))
-    hot = key.topk(seats).indices
+    hot = _top(demand, slots, gpus_per_node if local_group is not None else 1)
     hot = torch.where(demand[hot] > 0, hot, -1)
-    return _deal(hot, E, slots, gpus_per_node, ep_group)
+    return _deal(hot, demand.numel(), slots, gpus_per_node, ep_group)
+
+
+def _top(score: torch.Tensor, count: int, stripes: int) -> torch.Tensor:
+    """Take the count best experts of every stripe, a stripe being the experts e % stripes == q.
+
+    A stable sort sends ties to the lower expert id on every rank.
+
+    Returns:
+        best: [count * stripes] experts; entry i * stripes + q is the i-th best of
+            stripe q, the order in which _deal() gives stripe q to the node's rank q.
+    """
+    top = score.view(-1, stripes).argsort(dim=0, descending=True, stable=True)[:count]
+    return (top * stripes + torch.arange(stripes, device=score.device)).flatten()
 
 
 def _deal(
@@ -220,7 +230,7 @@ def choose_guests_by_pilots(
     RBD sends pilots, not copies, and a pilot goes only when every copy behind it has a
     guest. This takes the guests in `rounds` equal batches by pilot_credit(), counting
     the guests of earlier batches as taken, so later batches finish the pilots that
-    earlier ones opened. One round is a single weighted count; slots * G rounds add one
+    earlier ones opened. One round is a single weighted count; `slots` rounds add one
     guest at a time. Placements and collectives are those of choose_guests(), with one
     all_reduce over local_group per round.
 
@@ -238,16 +248,14 @@ def choose_guests_by_pilots(
     """
     world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
     E, G = num_experts, gpus_per_node
-    seats = slots * G if local_group is not None else slots
+    stripes = G if local_group is not None else 1
     taken = torch.zeros(E + 1, dtype=torch.bool, device=route.device)
     hot = []
     for i in range(rounds):
         credit = pilot_credit(route, E, rank // G, world // G, taken[:E])
         if local_group is not None:
             dist.all_reduce(credit, group=local_group)
-        # A stable sort breaks ties the same way on every rank of the node.
-        best = credit.argsort(descending=True, stable=True)
-        best = best[: seats * (i + 1) // rounds - seats * i // rounds]
+        best = _top(credit, slots * (i + 1) // rounds - slots * i // rounds, stripes)
         best = torch.where(credit[best] > 0, best, -1)
         taken[torch.where(best >= 0, best, E)] = True
         hot.append(best)

@@ -51,7 +51,7 @@ step() {
 }
 all="srun -N $N --ntasks-per-node=4 --kill-on-bad-exit=1"
 bench="$PY -u -m benchmark.all2all.combine_dispatch $RUN"
-model="$PY -u scripts/ds_moe.py --config-pth configs/qwen_ep$((4 * N)).json"
+model="$PY -u scripts/ds_moe.py --config-pth configs/qwen_ep$((4 * N)).json ${MODEL:+--model $MODEL}"
 
 # What an all2all and the experts cost each other when they overlap.
 if wants contention; then
@@ -100,5 +100,49 @@ if wants final; then
       rbd_guests:slots=24,source=static rbd_guests:slots=24,source=oracle \
       rbd_guests:slots=24,placement=redundant"}
   LOGS=$OUT/final step final 600 $all $model --repeats 5 --profile --modes $FINAL_MODES
+fi
+
+# The 2026-11-23 steps. S is the guest slots per rank.
+S=${SLOTS:-24}
+events="--repeats 5 --profile events"
+# Did the merge and the cleanup keep the timings? The same modes from the checkout
+# before them (OLD) and from this one, one after the other.
+if wants ab; then
+  OLD=${OLD:-/global/cfs/cdirs/m5421/eku/spec_ep_worktrees/pipeline-prefetch}
+  ab="autoep rbd two_lane rbd_pipe:degree=2 rbd_guests:slots=$S"
+  LOGS=$PWD/$OUT/ab_old step ab_old 420 env PYTHONPATH="$OLD/.deps:$OLD" \
+      $all --chdir "$OLD" $model $events --modes $ab
+  LOGS=$OUT/ab_new step ab_new 420 $all $model $events --modes $ab
+fi
+# Few tokens: SHAPES are sequences per rank x tokens per sequence. Prefetch from a
+# prediction, from another batch and from the batch itself, on two-lane RBD with and
+# without the pipeline, and the routing of each shape for benchmark.activation_spread.
+if wants few; then
+  for shape in ${SHAPES:-1x512 2x512 1x128}; do
+    FEW_MODES=${FEW_MODES:-"autoep plain rbd two_lane rbd_pipe:degree=2 rbd_pipe:degree=2,lanes=2 \
+        rbd_guests:slots=$S rbd_guests:slots=$S,source=static rbd_guests:slots=$S,source=oracle \
+        rbd_guests:slots=$S,degree=2 rbd_guests:slots=$S,source=static,degree=2 \
+        rbd_guests:slots=8 rbd_guests:slots=8,source=static rbd_guests:slots=8,degree=2"}
+    LOGS=$OUT/few_$shape step few_$shape 420 $all $model --sequences ${shape%x*} \
+        --seq-len ${shape#*x} --record $events --modes $FEW_MODES
+  done
+fi
+# Where the forward goes, as events: the pipeline and prefetch on one lane and on two,
+# then the other libraries in DeepEP's process environment (scripts/jobs/baselines_replicas.sh).
+if wants profile; then
+  OURS=${OURS:-"autoep plain rbd two_lane rbd_pipe:degree=2 rbd_pipe:degree=2,lanes=2 \
+      rbd_guests:slots=$S rbd_guests:slots=$S,degree=2 rbd_guests:slots=$S,lanes=1 \
+      rbd_guests:slots=$S,lanes=1,degree=2 rbd_guests:slots=$S,source=static \
+      rbd_guests:slots=$S,source=static,degree=2 rbd_guests:slots=$S,source=oracle \
+      rbd_guests:slots=$S,choice=pilots rbd_guests:slots=$S,source=oracle,choice=pilots,rounds=96"}
+  LOGS=$OUT/profile_ours step profile_ours 600 $all $model --record $events --modes $OURS
+  DEEPEP=/pscratch/sd/e/eku/deepep_multinode/build
+  deepep_env="env PYTHONPATH=$(ls -d $DEEPEP/deepep-nvl4/lib.*):$PYTHONPATH \
+      LD_PRELOAD=$DEEPEP/nvshmem-3.4.5-install/lib/libnvshmem_host.so.3 \
+      NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=hsn DEEPEP_SKIP_NVLINK_CHECK=1"
+  OTHERS=${OTHERS:-"autoep rbd two_lane tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
+      deepep:fused=True,num_sms=48,rdma_chunk=128"}
+  LOGS=$OUT/profile_others step profile_others 480 $deepep_env $all -c 32 $model $events \
+      --modes $OTHERS
 fi
 echo "##### done $(date +%T)"
