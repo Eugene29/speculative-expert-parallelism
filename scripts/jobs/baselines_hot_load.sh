@@ -96,7 +96,7 @@ if wants tutel; then
       plain tutel:capacity_factor=1 ds_moe:capacity_factor=1 \
       ds_moe:capacity_factor=1,dense=True ds_moe:capacity_factor=2,dense=True
   step tutel_ffn 180 $two $bench 0 --repeats 5 --iterations 2 --expert ffn --modes \
-      plain plain_pipe tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
+      plain tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
       tutel:capacity_factor=1,degree=4 ds_moe:capacity_factor=1
   step tutel_2dh 150 $two $bench 0 --repeats 5 --iterations 2 --modes \
       plain tutel:capacity_factor=1 tutel:capacity_factor=1,local_size=4

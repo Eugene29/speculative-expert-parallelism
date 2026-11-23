@@ -125,19 +125,26 @@ GUESTS = "rbd_guests"  # the one mode built here, not by benchmark/all2all/modes
 Row = tuple[str, str, str, str]  # scope, step, category and link of one row of the events table
 
 
-def load_model(model_id: str, dtype: torch.dtype) -> Qwen3_5MoeForCausalLM:
+def load_model(model_id: str, dtype: torch.dtype, layers: int | None = None) -> Qwen3_5MoeForCausalLM:
     """Load the text backbone on CPU and print its parameter counts.
+
+    Args:
+        layers: Keep only the model's first `layers` layers, which is how a model too
+            large for the allocation is timed: its layers keep their shape. The logits
+            of a cut model mean nothing.
 
     Returns:
         model: The model, not yet on any GPU.
     """
     print0("Loading model and tokenizer...")
+    cut = {} if layers is None else {"num_hidden_layers": layers}
     model, loading_info = Qwen3_5MoeForCausalLM.from_pretrained(
         model_id,
         dtype=dtype,
         device_map=None,
         attn_implementation="sdpa",
         output_loading_info=True,
+        **cut,
     )
 
     total, expert = count_params(model)
@@ -456,6 +463,8 @@ def parse_args() -> argparse.Namespace:
                         help="Path to the DeepSpeed config (e.g. configs/qwen_ep4.json)")
     parser.add_argument("--model", type=str, default="/pscratch/sd/e/eku/spec_ep/models/Qwen3.6-35B-A3B",
                         help="Model directory; must be a qwen3_5_moe checkpoint")
+    parser.add_argument("--layers", type=int, default=None,
+                        help="Keep the model's first LAYERS layers, to fit a large model on few nodes")
     parser.add_argument("--seq-len", type=int, default=4096, help="Tokens per sequence")
     parser.add_argument("--sequences", type=int, default=1, help="Sequences per rank")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"],
@@ -493,7 +502,7 @@ def main() -> None:
     }
     sources = {settings.get("source", "speculative") for settings in guest_settings.values()}
 
-    model = load_model(model_id, getattr(torch, args.dtype))
+    model = load_model(model_id, getattr(torch, args.dtype), args.layers)
     # Guests load from host memory, so the experts of other nodes are kept there: the
     # one in gpus_per_node a rank can host, or all of them if a mode has redundant guests.
     redundant = any(s.get("placement") == "redundant" for s in guest_settings.values())

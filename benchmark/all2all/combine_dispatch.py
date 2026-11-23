@@ -5,15 +5,15 @@ tokens to their experts' ranks, runs the experts, and combines the weighted outp
 back on the source rank.
 
 Modes (--modes; plain always runs, since every mode is checked and reported against it)
-are listed in benchmark/all2all/modes.py: plain, plain_fused, rbd, two_lane, plain_pipe,
-rbd_pipe, autoep, tutel, ds_moe, xmoe and deepep. A mode takes settings as
+are listed in benchmark/all2all/modes.py: plain, plain_fused, rbd, two_lane, autoep,
+tutel, ds_moe, xmoe and deepep. A mode takes settings as
 name:key=value,key=value, the keyword arguments of its function, so one run can time a
 mode several times, as in tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2.
 
 A mode that drops copies is checked against plain run on the copies it keeps.
 
-Node layout: rbd, two_lane and rbd_pipe need at least two nodes, since RBD saves
-nothing on one. deepep needs every rank on one node unless the multinode DeepEP build
+Node layout: rbd and two_lane need at least two nodes, since RBD saves nothing on
+one. deepep needs every rank on one node unless the multinode DeepEP build
 is on PYTHONPATH (see benchmark/all2all/baselines.py). The other modes run on any
 layout.
 
@@ -55,11 +55,8 @@ Experts in the timed runs (--expert):
     identity (default): returns its rows, so only communication is timed.
     ffn: one gated feed-forward block as in Qwen3.6-35B-A3B,
         down(silu(gate(x)) * up(x)) with --intermediate columns in between, applied to
-        every row whatever its expert id. The experts then cost real GPU time, which
-        is what the pipelined modes overlap with the network.
-plain's time with ffn minus its time with identity is the expert time. Therefore
-T_pipe(identity) + expert time - T_pipe(ffn) is the expert time a pipelined mode hid
-under communication.
+        every row whatever its expert id. The experts then cost real GPU time.
+plain's time with ffn minus its time with identity is the expert time.
 
 --trace DIR runs every mode once more under torch.profiler, with the --expert experts,
 and writes DIR/{mode}_rank{r}.json on every rank. In a chrome trace viewer they show
@@ -75,8 +72,8 @@ Usage:
 
     USE_NVRTC=1 srun -N 2 --ntasks-per-node=4 \
         python -u -m benchmark.all2all.combine_dispatch \
-        logs/2026_oct/2026-10-16_14-07-50 0 --degree 2 \
-        --modes plain plain_fused rbd two_lane plain_pipe rbd_pipe \
+        logs/2026_oct/2026-10-16_14-07-50 0 \
+        --modes plain plain_fused rbd two_lane \
                 tutel tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
                 ds_moe:capacity_factor=1
 
@@ -88,7 +85,7 @@ Usage:
 
     srun -N 2 --ntasks-per-node=4 \
         python -u -m benchmark.all2all.combine_dispatch \
-        logs/2026_oct/2026-10-16_14-07-50 0 --modes plain plain_pipe rbd rbd_pipe \
+        logs/2026_oct/2026-10-16_14-07-50 0 --modes plain rbd two_lane \
         --expert ffn [--intermediate 512] --trace $SCRATCH/traces
 
     # 64 replicas per node, chosen from another recording to remove the most pilots.
@@ -197,8 +194,6 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, default=2048, help="H, token width")
     parser.add_argument("--gpus-per-node", type=int, default=4)
     parser.add_argument("--pilot", choices=PILOT_RULES, default="rail", help="RBD pilot rule")
-    parser.add_argument("--degree", type=int, default=2,
-                        help="Slices of plain_pipe and rbd_pipe")
     parser.add_argument("--replicas", choices=RULES, help="Rule that chooses the replicas")
     parser.add_argument("--budget", type=int, default=64, help="Replicas per node")
     parser.add_argument("--cover", action="store_true",
@@ -255,7 +250,7 @@ if __name__ == "__main__":
     tokens, weights = make_inputs(route, args.hidden, device, seed=rank)
 
     modes = {
-        spec: build_mode(spec, E, G, local_group, pilot_rule=args.pilot, degree=args.degree)
+        spec: build_mode(spec, E, G, local_group, pilot_rule=args.pilot)
         for spec in specs
     }
     run = lambda mode, expert: mode(tokens, weights, expert, route)

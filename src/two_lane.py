@@ -10,13 +10,13 @@ sharing the multi-node one. The same split applies on the way back in stage 1
 combine. Stage 2, the experts and the final merge are RBD's own.
 
 two_lane_rbd_combine_dispatch() is rbd_combine_dispatch() with three changes:
-    1. start_plans(lanes=2) orders the stage 1 rows so each lane is one block of the
+    1. make_plan(lanes=2) orders the stage 1 rows so each lane is one block of the
        sent and of the received buffer, pilots and then direct rows, and no row is
        copied to split or join the lanes.
     2. two_lane_dispatch replaces stage1_dispatch.
     3. two_lane_combine replaces stage1_combine.
-Only the row order of the plan changes, so finish_plan, stage2_dispatch,
-stage2_combine and final_merge run unchanged.
+Only the row order of the plan changes, so stage2_dispatch, stage2_combine and
+final_merge run unchanged.
 
 Each lane's split sizes are read from the plan's send1 and recv1 lists, so planning
 costs what it costs RBD, with no added communication or host sync. A call makes six
@@ -38,12 +38,10 @@ from torch.profiler import record_function
 from spec_ep.ops import all2all, all2all_async
 from spec_ep.rbd import (
     Plan,
-    PlanStart,
     final_merge,
-    finish_plan,
+    make_plan,
     stage2_combine,
     stage2_dispatch,
-    start_plans,
     with_meta,
 )
 
@@ -134,24 +132,24 @@ def _two_lane_all2all(
 
 def two_lane_dispatch(
     tokens: torch.Tensor,
-    start: PlanStart,
+    plan: Plan,
     gpus_per_node: int,
     local_group: dist.ProcessGroup,
     ep_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
     """Send pilots over ep_group and direct rows over local_group at the same time.
 
-    Replaces stage1_dispatch. Collective over both groups. start is from
-    start_plans(lanes=2).
+    Replaces stage1_dispatch. Collective over both groups. plan is from
+    make_plan(lanes=2).
 
     Returns:
         received: [sum(recv1), H + M] pilots, then this node's direct rows, with
             their metadata columns. Each lane is ordered by source rank.
     """
     with record_function("autoep/two_lane_dispatch"):
-        rows = with_meta(tokens, start.meta)[start.send1_token]
+        rows = with_meta(tokens, plan.meta)[plan.send1_token]
         return _two_lane_all2all(
-            rows, start.send1, start.recv1, gpus_per_node, local_group, ep_group
+            rows, plan.send1, plan.recv1, gpus_per_node, local_group, ep_group
         )
 
 
@@ -199,15 +197,11 @@ def two_lane_rbd_combine_dispatch(
             order.
     """
     with record_function("autoep/rbd_plan"):
-        (start,) = start_plans(
-            route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, lanes=2
-        )
-    received = two_lane_dispatch(tokens, start, gpus_per_node, local_group, ep_group)
-    with record_function("autoep/rbd_plan"):
-        received, plan = finish_plan(start, received)
-    expert_inputs = stage2_dispatch(received, plan, local_group)
+        plan = make_plan(route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, lanes=2)
+    received = two_lane_dispatch(tokens, plan, gpus_per_node, local_group, ep_group)
+    expert_inputs, merge = stage2_dispatch(received, plan, local_group)
     with record_function("autoep/rbd_experts"):
         outputs = expert(expert_inputs, plan.expert_ids)
-    back = stage2_combine(outputs, plan, local_group)
+    back = stage2_combine(outputs, plan, merge, local_group)
     returned = two_lane_combine(back, plan, gpus_per_node, local_group, ep_group)
     return final_merge(returned, plan)

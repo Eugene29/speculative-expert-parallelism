@@ -14,8 +14,6 @@ Modes:
         the other experts within the node.
     two_lane: spec_ep.two_lane. RBD with the inter-node rows and the node-local rows
         in two all2alls that run at the same time.
-    plain_pipe, rbd_pipe: spec_ep.pipeline. plain and rbd on degree slices of the
-        tokens, so the experts of one slice run while the next is on the network.
     autoep: DeepSpeed's AutoEP layer after its router. One row per (token, expert),
         sorted by expert, in one all2all each way. fused=True merges with AutoEP's
         fused Triton kernel instead of its default weighted sum.
@@ -52,16 +50,14 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
-from spec_ep.pipeline import pipelined_plain_combine_dispatch, pipelined_rbd_combine_dispatch
 from spec_ep.plain import plain_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
 from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 MODES = (
-    "plain", "plain_fused", "rbd", "two_lane", "plain_pipe", "rbd_pipe",
-    "autoep", "tutel", "ds_moe", "xmoe", "deepep",
+    "plain", "plain_fused", "rbd", "two_lane", "autoep", "tutel", "ds_moe", "xmoe", "deepep",
 )
-NEED_TWO_NODES = {"rbd", "two_lane", "rbd_pipe", "xmoe"}
+NEED_TWO_NODES = {"rbd", "two_lane", "xmoe"}
 PADDED = {"tutel", "ds_moe"}
 
 Expert = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -99,7 +95,6 @@ def build_mode(
     local_group: dist.ProcessGroup,
     ep_group: dist.ProcessGroup | None = None,
     pilot_rule: str = "rail",
-    degree: int = 2,
 ) -> Mode:
     """Build the function of one mode. Collective for deepep, which builds its buffer.
 
@@ -110,7 +105,6 @@ def build_mode(
         local_group: Process group of this rank's node.
         ep_group: Process group holding the experts. None means the global group.
         pilot_rule: Pilot rule of the RBD modes, unless the settings give one.
-        degree: Slices of plain_pipe and rbd_pipe, unless the settings give one.
 
     Returns:
         mode: Maps (tokens, weights, expert, route) to the [num_tokens, H] combined
@@ -130,12 +124,6 @@ def build_mode(
     elif name == "two_lane":
         fn = partial(two_lane_rbd_combine_dispatch, num_experts=E, gpus_per_node=G,
                      local_group=local_group, **rbd)
-    elif name == "plain_pipe":
-        fn = partial(pipelined_plain_combine_dispatch, num_experts=E, degree=degree,
-                     ep_group=ep_group)
-    elif name == "rbd_pipe":
-        fn = partial(pipelined_rbd_combine_dispatch, num_experts=E, gpus_per_node=G,
-                     local_group=local_group, degree=degree, **rbd)
     elif name == "xmoe":
         from benchmark.all2all.xmoe import xmoe_combine_dispatch
 

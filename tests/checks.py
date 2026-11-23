@@ -1,7 +1,7 @@
 """Shared check for the combine-dispatch tests: layouts, routings and the expected answer.
 
-A test spawns one CPU process per rank over gloo and runs a combine-dispatch function
-end to end. Layouts follow Perlmutter, 4 GPUs per node. Each layout spawns once and
+A test spawns one process per rank over gloo, all on GPU 0, and runs a
+combine-dispatch function end to end. RBD's plan is Triton, so the ranks need a GPU. Layouts follow Perlmutter, 4 GPUs per node. Each layout spawns once and
 loops over every variant, pilot rule and routing inside the workers, since starting
 the processes costs far more than one call.
 
@@ -130,7 +130,7 @@ def _check_rank(
         layout: Ranks of this run.
         variants: Named functions to check, as in run_check().
     """
-    # The tensors are tiny; one thread per rank avoids 16 ranks x all cores fighting.
+    # One thread per rank avoids 16 ranks x all cores fighting.
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=layout.world
@@ -147,11 +147,11 @@ def _check_rank(
             for p, pilot_rule in enumerate(PILOT_RULES):
                 for r, (name, make_route) in enumerate(ROUTINGS.items()):
                     gen = torch.Generator().manual_seed(1000 * rank + 10 * p + r)
-                    route = make_route(gen, ep_rank, E)
+                    route = make_route(gen, ep_rank, E).cuda()
                     tokens = torch.randn(
                         route.shape[0], HIDDEN, generator=gen, dtype=torch.float64
-                    )
-                    weights = torch.rand(route.shape, generator=gen)
+                    ).cuda()
+                    weights = torch.rand(route.shape, generator=gen).cuda()
 
                     output = combine_dispatch(
                         tokens,

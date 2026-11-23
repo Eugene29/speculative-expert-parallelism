@@ -93,7 +93,7 @@ fi
 # Pipelining with a real feed-forward expert: what each library hides under the network.
 if wants pipe; then
   step pipe_ffn 200 $all $bench 0 $timing --expert ffn --trace "$OUT/traces_ffn" --modes \
-      plain plain_pipe rbd rbd_pipe tutel:capacity_factor=1 \
+      plain rbd tutel:capacity_factor=1 \
       tutel:capacity_factor=1,degree=2 tutel:capacity_factor=1,degree=4
 fi
 # Why Tutel's pipeline is slow: one all2all under each way of grouping its sends, then
@@ -165,7 +165,7 @@ fi
 # The Qwen model end to end, one load, every library as the MoE layers' dispatch.
 # MODEL_MODES narrows the modes.
 if wants model; then
-  MODEL_MODES=${MODEL_MODES:-"autoep autoep:fused=True plain rbd two_lane rbd_pipe \
+  MODEL_MODES=${MODEL_MODES:-"autoep autoep:fused=True plain rbd two_lane \
       ds_moe:capacity_factor=1 tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
       tutel:capacity_factor=1,degree=2,per_peer=True xmoe"}
   LOGS=$OUT/model step model 720 $all $PY -u scripts/ds_moe.py \
