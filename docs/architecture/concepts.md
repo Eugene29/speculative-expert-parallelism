@@ -19,7 +19,7 @@ Back to the [architecture map](../architecture.md).
 | pilot | The single row sent to another node on behalf of all of a token's copies there. |
 | pilot rank | The rank on that node which receives the pilot. Chosen by the pilot rule. |
 | replica | A row the pilot rank forwards to one expert on its node. |
-| expert function | `expert(rows, expert_ids) -> outputs`, same row order. Supplied by the caller. |
+| expert function | `expert(rows, expert_ids) -> outputs`, same row order. Supplied by the caller. RBD and two-lane call it with rows grouped by expert, ids ascending. |
 
 ## One token's round trip
 

@@ -15,10 +15,18 @@ Two-lane sends them in two all2alls that run at the same time: direct rows over
 
 1. `make_plan(lanes=2)` orders the stage 1 rows so that each lane's rows are one
    block: pilots first, then direct rows, on both the send and the receive side.
-2. `two_lane_dispatch` and `two_lane_combine` replace `stage1_dispatch` and
-   `stage1_combine`. Each starts the local lane with `all2all_async`, runs the
-   network lane, then waits for the local lane.
+2. `two_lane_rbd_combine_dispatch` starts both lanes with `all2all_async` in place of
+   `stage1_dispatch` and `stage1_combine`.
 3. `stage2_dispatch`, `stage2_combine` and `final_merge` run unchanged.
+
+With `early` the experts do not wait for the network lane. The direct rows arrive
+over NVLink in under a millisecond while the pilots take two to three, and their
+outputs are not needed before the pilot sums are back. So the experts run on a share
+`early` of the direct rows while the pilots travel out, and on the rest while the
+pilot sums travel back. No transfer is added and the expert function is called up to
+three times. NCCL moves rows with GPU kernels of its own, which slow down under the
+experts as the experts do under them, so most of the overlap is paid back: on the 400B
+model's first 30 layers on 2 nodes, 170 ms of overlap per forward bought 33 ms.
 
 The slice pipeline (`src/pipeline.py`, commit c730d7e) was removed: it lost to two-lane
 at every size but one (Plan 01).
@@ -58,6 +66,11 @@ forward before. The expert call runs a rank's experts and its guests in one outp
 launching DeepSpeed's grouped GEMM kernel once per weight tensor, with no host sync. It
 runs on two-lane RBD by default: a guest turns a pilot into same-node rows, which the
 all2all over all ranks carries slowly and the node's own communicator does not.
+
+On the 400B model at 4,096 tokens per rank guests make the forward slower: 8 guests
+are 201 MB of weights a layer against 34 MB of pilots per rank and direction, and with
+top 10 routing they remove few pilots, since a pilot goes only when all of a token's
+copies on that node are guests (400B 01).
 
 The earlier design loaded guests from pinned host memory into `slots` rows of every
 layer's weights (commit c730d7e): `layers * slots` experts of GPU memory and a copy of

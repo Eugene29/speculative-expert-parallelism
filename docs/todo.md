@@ -1,8 +1,10 @@
 # Todos
 
-The library is `ops.py`, `plain.py` and `rbd.py`, which has all four pilot rules, plus
-`two_lane.py` and `pipeline.py` built on `rbd.py`, and `replicas.py`, which chooses
-replicas and routes to them. Standalone benchmark scripts sit on top, and
+The library is `ops.py`, `plain.py` and `rbd.py`, plus `two_lane.py` built on `rbd.py`,
+`replicas.py`, which chooses replicas and routes to them, and `guests.py`, which
+chooses guests and pulls their weights from the ranks that own them. The benchmark is
+Qwen3.5-397B-A17B (400B 01): all 60 layers on 4 nodes of 80 GB GPUs, or its first 30
+layers on 2 nodes with `--layers 30`. Standalone benchmark scripts sit on top, and
 `benchmark/all2all/modes.py` builds every dispatch mode for both the layer benchmark
 and the model. See [architecture.md](architecture.md).
 
@@ -18,7 +20,8 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 - **The DeepSpeed fork's `comm_backend: "rbd"` has not been run since it was renamed
   to spec_ep's current functions.** The model benchmark does not use it: it sets the
   `combine_dispatch` hook of `AutoEPMoELayer` (`scripts/ds_moe.py --modes`). The fork's
-  changes are uncommitted in the submodule.
+  changes are uncommitted in the submodule. Its `comm_rbd_pipeline_degree` path
+  imports `pipelined_rbd_combine_dispatch`, which is gone since 400B 01.
 - **The fork's `comm_backend: "deepep"` is written for DeepEP V2, which does not
   compile for A100** (DeepEP 01). DeepEP runs in the model through the hook and the
   v1 adapter instead.
@@ -27,18 +30,25 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 
 ## Next up
 
-- [ ] Planned RBD: the plan made ahead of time. With replicas, few rows cross between
-  nodes and RBD's plan is what is left: on 2 nodes with 64 replicas per node, plain
-  with the fused merge (4.1 ms) passes every RBD variant (Hot experts 02).
-- [ ] Fold the routing to replicas into `make_plan`, as one kernel. It is a separate
-  step now, 0.22 ms per call for per-node routing and 0.72 ms for cover routing, which
-  is half of what cover routing gains on 4 nodes (Redundancy 01).
+- [ ] Inter-node transfer is the largest part of the forward on the target model: 700
+  of 1,874 ms on 4 nodes with two-lane and `early=0.5` (400B 01). RBD already sends
+  one row per token and node. NCCL's channels per peer are untried on this model
+  (NCCL 01).
+- [ ] One row per (token, rank) inside a node. Direct rows and stage 2 rows are one
+  per (token, expert). With 5 copies on a node of 4 ranks a token reaches 3.05 ranks on
+  average, so 39% of those rows are redundant on 2 nodes and 18% on 4 (a count, not a
+  measurement). NVLink transfer not under another is 196 ms per forward on 4 nodes.
+  The expert rank would expand a row to its experts and sum before returning.
+- [ ] The count exchange. 42 to 45 ms per forward on 4 nodes, 0.7 ms per layer for a
+  few kilobytes, more than the plan's compute (24 ms). 5.5 ms on 2 nodes (400B 01).
+- [ ] `early` at few tokens per rank. It gains 4.1% on 2 nodes and 4.9% on 4 at 4,096
+  tokens and is an option, not the default: three expert calls cost more when the
+  batch is small (400B 01).
+- [ ] Fold the routing to replicas into `make_plan`, as part of its kernel. It is a
+  separate step now, 0.22 ms per call for per-node routing and 0.72 ms for cover
+  routing, which is half of what cover routing gains on 4 nodes (Redundancy 01).
 - [ ] Replicas in the model: `scripts/ds_moe.py` has no `--replicas` yet, so cover
   routing is timed on one layer only.
-- [ ] Real replicas: load and hold the weights. `combine_dispatch --replicas` emulates
-  them by rerouting. A replica per rank, not per node, is untried.
-- [ ] One plan for all slices of the plain pipeline. `pipelined_plain_combine_dispatch`
-  still plans per slice; the RBD pipeline no longer does.
 - [ ] Plain's count exchange. It takes 1.9 ms of plain's 10 ms for a few bytes
   (Baselines 01). Tutel and DeepSpeed's MOELayer need no such exchange.
 - [ ] `even_vs_uneven.py`: count the off-rank bytes of every rank. It now multiplies
@@ -46,24 +56,30 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 
 ## Performance
 
-- [ ] The plan as one layout kernel. It is 0.9 ms per layer now, about 105 torch
-  operations of which 40 are views, where DeepEP's is 0.06 ms (Plan 01). The source
-  half's classification and count slots, about 30 operations, would be one launch.
-- [ ] The pipeline's cost per slice. A second slice adds about 2.3 ms per layer at 512
-  to 1024 tokens per rank: its half of the plan, an expert call, and four more
-  all2alls. Nothing at that size is long enough to hide them (Plan 01).
-- [ ] A degree the pipeline picks itself. With 1024 tokens per rank one slice beats
-  AutoEP and two lose to it (Plan 01); every rank must pick the same degree.
+- [ ] The rest of the plan's source half. The token kernel is 68 us of 0.58 ms; the
+  rest is about 45 small torch operations and the host sync. Doing that arithmetic on
+  the host was slower in the model, because its upload is a second synchronous copy.
+  Untried: a pinned, non-blocking upload, and expert ids built by the kernel that
+  already walks the runs (400B 01).
+- [ ] The stage 1 pack. `with_meta` copies every token to append the metadata and the
+  gather copies the rows again; one kernel could write the send rows. Two-lane's
+  dispatch compute is 18 ms per forward on 4 nodes (400B 01).
+- [ ] Guests cannot pay for a transfer per layer at 4,096 tokens per rank: 8 guests
+  are 201 MB of weights against 34 MB of pilots per rank and direction, and they
+  remove 1 to 5% of the pilots (400B 01). The byte counts are equal near 40,000 tokens
+  per rank (an estimate). Open: guests held across forwards, which is what replicas
+  are, and a cap on what one rank sends, since the owner of the hot experts sends up to
+  21 guests in a layer while every rank receives 8.
+- [ ] Guests remove copies, not pilots, with top 10 routing: a pilot goes only when all
+  of a token's copies on that node are guests. 16 oracle guests per rank leave 78% of
+  the pilots on 4 nodes and 55% of the copies (400B 01). They would help a plain
+  all2all more than RBD.
 - [ ] RBD at 512 tokens per rank and below. AutoEP and plain take 0.17 to 0.18 s and
-  RBD 0.205 s: every all2all and every operation costs its fixed latency there, and
-  RBD makes more of both (Plan 01).
-- [ ] Guests' weights in one buffer per expert. A speculative load is three copies per
-  guest, one per weight tensor, each a call on the host.
-- [ ] Guest rows for the layers that need them only. Guests take `layers * slots`
-  experts of GPU memory since Plan 01, which Qwen3.5-122B cannot hold on 40 GB.
-- [ ] The event totals of the guest modes. Their comm and compute inside the MoE
-  layers add up to more than the forward, because a guest load shows as a long
-  in-flight transfer; only their per-step rows are usable (Guests 02).
+  RBD 0.205 s on the 35B model: every all2all and every operation costs its fixed
+  latency there, and RBD makes more of both (Plan 01).
+- [ ] The event totals of the guest mode. Its comm and compute inside the MoE layers
+  add up to more than the forward, because a guest transfer shows as a long in-flight
+  event; only the per-step rows are usable (Guests 02, 400B 01).
 - [ ] RBD in one all2all with replicas is slower than without (5.6 to 6.1 ms on 2
   nodes at 8 channels per peer). The lead: the communicator of all ranks has 8 p2p
   channels in total against the node communicator's 32 (NCCL 01).
@@ -110,6 +126,13 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 - [ ] Why offload and inter-node prefetch do not hide under a dispatch (Expert
   loading 01). The shared PCIe link is a guess.
 - [ ] Where the 8.7e-3 error against plain, the same for every mode, comes from.
+- [ ] On the 60-layer 400B model in bf16, plain, RBD and two-lane differ from AutoEP by
+  29 to 34% in the last logits with the same top token on 98% of the last tokens.
+  Plain differs as much as RBD, and a small model in float32 agrees to 8e-6, so it
+  reads as rounding, but a float32 run of the 400B does not fit in memory (400B 01).
+- [ ] Rank-level load. The all2all after the experts takes 1.4 ms where the one
+  before takes 0.8 ms for the same rows on 2 nodes. A rank whose experts finish early
+  waits for the others; that this is the cause is inferred, not measured (400B 01).
 - [ ] Run the `flops` and `comm` profilers of `scripts/ds_moe.py` on a model.
 
 ## Small code items
@@ -124,12 +147,27 @@ Each comes back as one file that imports only public names: the plan and stage
 functions of `rbd.py`, and `ops.py`.
 
 - [ ] Hot-expert swaps. Replicas are back (`src/replicas.py`); swaps are not.
+- [ ] Low priority: the slice pipeline (`src/pipeline.py`) and the pilot rules `most`
+  and `even`, removed with the sort-based plan. Commit c730d7e has them.
 - [ ] Low priority: Expert placement searches.
 - [ ] Low priority: Preemptive partition: bisect the experts by co-activation.
 
 ## Done
 
 Finished items move here with the date and where the result is written up.
+
+- [x] 2026-11-23. The plan as kernels: `make_plan`, one kernel over the tokens with
+  atomic adds in place of both sorts. 1.16 to 0.65 ms per layer on one A100, and 18.9
+  to 10.4 ms of plan compute per forward on the 400B model's first 30 layers (400B 01).
+- [x] 2026-11-23. Guests pulled GPU to GPU into slots all layers share, in place of
+  the host store: `GuestPool`, `exchange_requests`, and `balance` for the choice by
+  pilots. They lose at 4,096 tokens per rank on 2 and 4 nodes (400B 01).
+- [x] 2026-11-23. The experts get rows grouped by expert, so DeepSpeed's sort and
+  scatter go: two-lane 2.057 to 1.970 s on the whole 400B model on 4 nodes (400B 01).
+- [x] 2026-11-23. The direct rows' experts under the network lane
+  (`two_lane_rbd_combine_dispatch(early=0.5)`): 1.970 to 1.874 s on 4 nodes (400B 01).
+- [x] 2026-11-23. The 400B benchmark: `scripts/jobs/gpu_prefetch.sh`, `--layers`,
+  `benchmark/plan_cost.py` and `benchmark/guest_choice.py` (400B 01).
 
 - [x] 2026-11-23. A cheaper plan, after DeepEP's: a cached layout, metadata in the
   stage 1 rows, one sort for all slices in lane order. 93 to 35 ms per forward in

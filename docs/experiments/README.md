@@ -22,10 +22,13 @@ Each experiment is written up as one Notion page under
 | [Guests 01](https://app.notion.com/p/421e2e64355e81578af1eb590518db0f): hot experts of other nodes loaded from host memory, chosen by prediction | `src/guests.py`, `scripts/ds_guests.py`, `scripts/ds_moe.py --modes rbd_guests:...` | `guests`, `slots`, `final` of `pipeline_prefetch.sh` | `logs/2026-11-22_pipeline/2n_guests/`, `2n_b/`, `2n_c/`, `2n_d/` |
 | [Guests 02](https://app.notion.com/p/421e2e64355e8187aba7da6040049580): few tokens, profiles against the libraries, an RBD benefit metric, and Qwen3.5-122B | `benchmark/activation_spread.py`, `benchmark/rbd_benefit.py`, `src/pipeline.py` (`lanes=2`), `src/guests.py` (`choose_guests_by_pilots`), `scripts/ds_moe.py --sequences` | `ab`, `few`, `profile`, `others`, `big`, `big_guests`, `big_others` of `pipeline_prefetch.sh` | `logs/2026-11-23_merge/2n/`, `2n_b/`, `2n_d/` in the worktree `spec_ep_worktrees/merge-pipeline-prefetch` |
 | [Plan 01](https://app.notion.com/p/421e2e64355e81b9a3bdce9b5a712dda): RBD's plan after DeepEP's, and guests against AutoEP at few tokens | `src/rbd.py` (`start_plans`, `finish_plan`), `scripts/ds_guests.py`, `scripts/ds_moe.py --modes` | `ab`, `few`, `others` of `pipeline_prefetch.sh` | `logs/2026-11-23_plan/tree_a/logs/2n_a/`, `tree_b/logs/2n_b/`, `tree_c/logs/4n/` in the worktree `spec_ep_worktrees/plan-inband` |
+| [400B 01](https://app.notion.com/p/421e2e64355e81d394bbfcf5eba644ad): the plan as kernels, guests pulled GPU to GPU, and where the forward goes on Qwen3.5-397B | `src/rbd.py` (`make_plan`), `src/two_lane.py` (`early`), `src/guests.py` (`GuestPool`), `scripts/ds_guests.py`, `benchmark/plan_cost.py`, `benchmark/guest_choice.py` | `plan`, `model`, `guests`, `old` of `gpu_prefetch.sh` | `logs/2026-11-23_gpu_prefetch/2n/`, `2n_b/`, `2n_c/`, `4n/`, `guest_choice*.out` in the worktree `spec_ep_worktrees/gpu-prefetch` |
 
 The job steps of the first three pages are those of `scripts/jobs/baselines_hot_load.sh`, and
 the later ones those of `scripts/jobs/baselines_replicas.sh`, picked with `STEPS`; the
-Pipeline and Guests pages use `scripts/jobs/pipeline_prefetch.sh`. A
+Pipeline, Guests and Plan pages use `scripts/jobs/pipeline_prefetch.sh`, which commit
+c730d7e has; it went with the pipeline and the host store. 400B 01 uses
+`scripts/jobs/gpu_prefetch.sh`. A
 `baselines_replicas.sh` job leaves the script it ran as `job.sh` in its output directory.
 `benchmark/summarize.py` turns a job's `.out` files into the tables on the pages.
 `logs/` is not in git.

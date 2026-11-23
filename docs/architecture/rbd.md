@@ -13,8 +13,8 @@ move the rows.
 
 The plan follows DeepEP's: a layout computed where the tokens are, and rows that carry
 what their receiver must know. The only planning communication is the count exchange
-that NCCL needs before it can receive. The plan is GPU only: its two halves are one
-Triton kernel each.
+that NCCL needs before it can receive. The plan is GPU only: it is three Triton
+kernels, two in `make_plan` and one on the pilot rank.
 
 `make_plan` is the source rank's half. No token data moves.
 
@@ -24,6 +24,7 @@ Triton kernel each.
 | 2. Exchange counts | The ranks exchange the count table, one row per destination rank. | All2all 1, small. |
 | 3. Place the rows | A bucket's first row is a prefix sum over the buckets in sending order. A stage 1 row's place is its bucket's start plus its slot. | None. |
 | 4. Read sizes | Every split size is read from the GPU at once. | The only host sync. |
+| 5. `_group_kernel` | One program per run of rows this rank's experts get. It orders the direct rows by expert, and the stage 2 rows by expert, and writes each row's place in that order and the expert ids. | None. |
 
 The pilot rank's half is `_fan_out`, inside `stage2_dispatch`. A pilot's metadata names
 all of its token's experts; the ones on this node are the copies of stage 2.
@@ -47,6 +48,15 @@ Notes:
   columns for bf16 at k = 10, 1% of a 4096-wide row. Direct rows carry them unused.
 - **Lanes.** `make_plan(lanes=2)` only changes the sending order of the buckets:
   every rank's pilots first, then every rank's direct rows.
+- **Grouping.** A part's rows arrive by source rank and then expert, so the rows of
+  one (rank, expert) are a run, and the count exchange already gave this rank the
+  length of every run. Step 5 moves whole runs: a part's rows are by expert and then
+  rank afterwards. The experts then need no sort, which in DeepSpeed's hook is a
+  gather and a scatter of every row (39 ms of a 798 ms forward on the 400B model).
+- **What bounds it.** On one A100 at the 400B layer shape the token kernel takes
+  31 us to launch and 37 us to run. The rest of `make_plan`, about 0.5 ms, is some 45
+  small torch operations and the host sync. Moving that arithmetic to the host was
+  tried and was slower in the model.
 
 ## The `Plan`
 
@@ -58,7 +68,9 @@ Notes:
 | Stage 2 | `pilot_row` | `[num_pilots]` | Received stage 1 row of each pilot. |
 | Stage 2 | `send2`, `recv2` | one int per rank of the node | Rows to and from each rank of this node. |
 | Stage 2 | `send2_start`, `first_expert` | `[G * L]`, int | First stage 2 row sent for each expert of this node, and the node's first expert. |
-| Experts | `expert_ids` | `[expert inputs]` | Expert of each input row. |
+| Experts | `direct_order`, `direct_place` | `[num_direct]` | Received stage 1 row of each direct row, by expert, and where each direct row is in that order. |
+| Experts | `stage2_order`, `stage2_place` | `[sum(recv2)]` | The same for the stage 2 rows, as rows of the stage 2 buffer. |
+| Experts | `expert_ids` | `[expert inputs]` | Experts of the direct rows, then of the stage 2 rows, each part ascending. |
 | Final merge | `final_index`, `final_weight` | `[T, k]` | Returned stage 1 row of each copy (-1 if a pilot covers it), and its weight. |
 | Stage 1 | `meta` | `[T, 2k]` int32 | Every token's routing, then the bits of its weights. |
 
@@ -70,15 +82,20 @@ both `[num_pilots, k]`, the returned replica rows of each pilot and their weight
 | Stage | Runs over | Input | Output | Row order of the output |
 |---|---|---|---|---|
 | `stage1_dispatch` | EP group | `with_meta(tokens, meta)[send1_token]` | `received [sum(recv1), H + M]` | By source rank. This node's direct rows form one block, with pilots on either side. |
-| `stage2_dispatch` | local group | `received[send2_row, :H]` | `inputs [num_direct + sum(recv2), H]`, and the `Merge` | Direct rows, then stage 2 rows. |
-| (experts) | this rank | `inputs`, `expert_ids` | `outputs`, same shape | Same as `inputs`. |
-| `stage2_combine` | local group | `outputs[num_direct:]` | `back [sum(recv1), H]` | Same as `received`: direct outputs in their block, one weighted sum in each pilot's row. |
+| `run_direct` | this rank | `received[direct_order, :H]` | the direct rows of `back [sum(recv1), H]` | As `received`: the experts run on rows grouped by expert, and `direct_place` puts their outputs back. |
+| `stage2_dispatch` | local group | `received[send2_row, :H]` | `rows [sum(recv2), H]`, and the `Merge` | Grouped by expert. |
+| `run_experts` | this rank | `rows`, `expert_ids[num_direct:]` | `outputs`, same shape | Same as `rows`. |
+| `stage2_combine` | local group | `outputs[stage2_place]` | the pilot rows of `back` | One weighted sum in each pilot's row. |
 | `stage1_combine` | EP group | `back` | `returned [sum(send1), H]` | The stage 1 send order. |
 | `final_merge` | this rank | `returned` | `output [T, H]` | Token order. |
 
-`rbd_combine_dispatch` calls these in order, with the expert function between
-`stage2_dispatch` and `stage2_combine`. The stage functions are public, so a later
-variant can reorder or replace them.
+`rbd_combine_dispatch` calls these in order. The stage functions are public, so a
+variant can reorder or replace them, as two-lane does.
+
+The expert function is called twice, on the direct rows and on the stage 2 rows, each
+time with rows grouped by expert and ids ascending. A caller whose experts want
+grouped rows can therefore skip its own sort: `scripts/ds_moe.py` does, for the modes
+in `benchmark/all2all/modes.GROUPED`.
 
 Things worth knowing:
 
@@ -90,8 +107,9 @@ Things worth knowing:
   weight 1.
 - **The weighted sums use `gather_sum`** from `src/ops.py`: a Triton kernel on GPU,
   plain PyTorch on CPU and for float64, which the tests use.
-- **Cost of one call.** One small planning all2all, one host sync, two plan kernels,
-  and four data all2alls: two over the EP group and two inside the node.
+- **Cost of one call.** One small planning all2all, one host sync, three plan
+  kernels, two expert calls, and four data all2alls: two over the EP group and two
+  inside the node.
 
 ## Pilot rules
 

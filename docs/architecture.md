@@ -47,10 +47,10 @@ Imports point one way: each layer imports only from the layers above it in this 
 |---|---|---|
 | `src/ops.py` | Operations shared by the algorithms. | `all2all`, `all2all_async`, `gather_sum` |
 | `src/plain.py` | The plain reference. | `plain_combine_dispatch` |
-| `src/rbd.py` | RBD: the plan, as one Triton kernel on each side of stage 1, and the five stages. GPU only. | `Plan`, `Merge`, `make_plan`, `with_meta`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
+| `src/rbd.py` | RBD: the plan, as three Triton kernels, and the five stages. GPU only. | `Plan`, `Merge`, `Expert`, `make_plan`, `with_meta`, `stage1_dispatch`, `run_direct`, `stage2_dispatch`, `run_experts`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
 | `src/replicas.py` | Replicas of experts on other nodes: choosing them, routing to them, and rewriting a routing so the dispatch functions use them. | `RULES`, `choose_replicas`, `serving_node`, `replica_ids`, `relabel`, `inter_node_rows` |
 | `benchmark/utils.py` | Launch, recorded routing, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `load_sample`, `expert_counts`, `make_inputs`, `time_ms` |
-| `src/two_lane.py` | RBD with stage 1 in two lanes. | `two_lane_all2all_async`, `two_lane_dispatch`, `two_lane_combine`, `two_lane_rbd_combine_dispatch` |
+| `src/two_lane.py` | RBD with stage 1 in two lanes, and optionally the direct rows' experts under the network lane. | `two_lane_rbd_combine_dispatch` |
 | `src/guests.py` | Guest experts: choosing a rank's guests from routing demand or from the pilots they remove, numbering them for RBD, and the pool that pulls their weights from the ranks that own them into slots all layers share. | `Guests`, `Request`, `remote_demand`, `choose_guests`, `pilot_credit`, `choose_guests_by_pilots`, `no_guests`, `home_ids`, `exchange_requests`, `GuestPool` |
 | `benchmark/all2all/modes.py` | Every dispatch-and-combine version behind one call, `mode(tokens, weights, expert, route)`. The layer benchmark and the model script both build their modes here. | `MODES`, `parse_mode`, `build_mode` |
 | `benchmark/all2all/combine_dispatch.py` | Every mode against plain on recorded routing, optionally with replicas. | |
