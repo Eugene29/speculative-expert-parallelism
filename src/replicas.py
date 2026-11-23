@@ -102,9 +102,8 @@ def serving_node(
     holders = (held.long() * node_bit.unsqueeze(1)).sum(dim=0)[route]
     source_bit = 1 << source
 
-    # Smallest node set: score all 2^num_nodes sets at once. A set must include the
-    # token's node and hold every expert. Among the smallest, token i takes the
-    # (i mod count)-th, so every one of them gets an equal share.
+    # Score all 2^num_nodes sets at once. A valid set includes the token's node and
+    # holds every expert. Among the smallest, token i takes the (i mod count)-th.
     sets = torch.arange(1 << num_nodes, device=device)
     set_size, member = _node_sets(num_nodes, device)
     token = torch.arange(num_tokens, device=device).unsqueeze(1)
@@ -113,8 +112,7 @@ def serving_node(
     turn = token % smallest.sum(dim=1, keepdim=True)
     best_set = ((smallest.cumsum(dim=1) == turn + 1) & smallest).long().argmax(dim=1, keepdim=True)
 
-    # One node of the set per copy: own node, else home, else one of the set's holders,
-    # again taken in turn by token index.
+    # Each copy takes its own node, else its home, else one of the set's holders in turn.
     usable = holders & best_set
     other = member[usable, (token % set_size[usable].clamp_min(1)).expand_as(route)]
     dest = torch.where((usable >> home) & 1 == 1, home, other)
@@ -164,7 +162,6 @@ def choose_replicas(
         route: [num_tokens, k] experts each sampled token is routed to.
         source_node: [num_tokens] node each sampled token starts on.
         num_experts: Total number of experts, split evenly over the nodes.
-        num_nodes: Number of nodes.
         budget: Replicas per node.
         rule: One of RULES.
 

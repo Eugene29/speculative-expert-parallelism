@@ -9,20 +9,23 @@ replaces it with that mode's function, the same one the layer benchmark times.
 rbd_guests is built here (scripts/ds_guests.py): RBD in which every rank also runs the
 hottest experts of other nodes, loaded from host memory one layer ahead. Its settings
 are slots (guests per rank), source (speculative, static or oracle), placement (unique
-or redundant) and degree (slices of the RBD pipeline), as in
-rbd_guests:slots=16,source=static. After its first forward it prints how its guests
-compare with the oracle's and what loading them took (GuestDispatch.measure).
+or redundant), lanes (2 for two-lane RBD, 1 for RBD in one all2all) and degree (slices
+of the one-lane RBD pipeline), as in rbd_guests:slots=16,source=static. After its
+first forward it prints how its guests compare with the oracle's and what loading them
+took (GuestDispatch.measure).
 
-For every mode the script first runs one untimed forward and prints how far its last
-logits are from the first mode's, and on how many of the last tokens both pick the
-same top token, and the peak GPU memory of that forward. A mode that drops copies, such as tutel at its default capacity,
-differs for that reason. Modes that keep every copy still differ in bf16, because
-their merge kernels round differently and 40 layers grow the difference; --dtype
-float32 shows whether they compute the same function. It then times --repeats rounds, one
-forward per mode in each, so the modes alternate, and prints each mode's median, min
-and max. Python's garbage collector is off inside every measured forward: a full
-collection takes a few hundred milliseconds here and stalls every rank, because the
-others wait for the collecting rank in their next transfer.
+For every mode the script first runs one untimed forward. It prints how far the
+forward's last logits are from the first mode's, on how many of the last tokens both
+pick the same top token, and the forward's peak GPU memory. A mode that drops copies,
+such as tutel at its default capacity, differs for that reason. Modes that keep every
+copy still differ in bf16, because their merge kernels round differently and 40 layers
+grow the difference. --dtype float32 shows whether they compute the same function.
+
+The script then times --repeats rounds of one forward per mode, so the modes
+alternate, and prints each mode's median, min and max. Python's garbage collector is
+off inside every measured forward. A full collection takes a few hundred milliseconds
+here and stalls every rank, because the others wait for the collecting rank in their
+next transfer.
 
 It also measures where the time goes, with each profiler of --profile:
 
@@ -131,7 +134,7 @@ def load_model(model_id: str, dtype: torch.dtype) -> Qwen3_5MoeForCausalLM:
     model, loading_info = Qwen3_5MoeForCausalLM.from_pretrained(
         model_id,
         dtype=dtype,
-        device_map=None,             # Load on CPU; DeepSpeed handles GPU placement
+        device_map=None,
         attn_implementation="sdpa",
         output_loading_info=True,
     )
@@ -364,8 +367,7 @@ def print_events(
     """Print one mode's traced forward against its timed one, its totals and its table.
 
     Args:
-        spec: The mode.
-        timed: Seconds of its timed forwards, one per round.
+        timed: Seconds of the mode's timed forwards, one per round.
         traced: Seconds of its traced forwards, one per round.
         rows: The table's rows, from summarize().
         numbers: What summarize() returns with them, as the mean over ranks and the
@@ -441,11 +443,10 @@ def run_ds_comm_profile(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse the command line, ignoring flags the DeepSpeed launcher adds.
+    """Parse the command line, ignoring flags the DeepSpeed launcher adds, such as --local_rank.
 
     Returns:
-        args: config_pth, model, seq_len, modes, gpus_per_node, repeats, record,
-            profile and trace_ranks.
+        args: The parsed flags.
     """
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--config-pth", type=str, default="configs/qwen_ep8.json",
@@ -472,7 +473,6 @@ def parse_args() -> argparse.Namespace:
                              "each timed one, the others run one forward per mode afterwards")
     parser.add_argument("--trace-ranks", type=int, nargs="*", default=[],
                         help="Ranks besides 0 that write their torch trace")
-    # deepspeed launcher may inject --local_rank; ignore unknown args
     args, _ = parser.parse_known_args()
     return args
 

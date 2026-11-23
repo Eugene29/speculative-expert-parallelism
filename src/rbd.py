@@ -27,8 +27,8 @@ are sorted by expert inside each block, so per-expert counts give the ids.
 Letters used throughout: E experts in total, L experts per rank, G ranks per node,
 H token width, k experts per token.
 
-TODO: Support backprop. The all2alls don't carry gradients, so tokens and expert
-parameters get no gradient through rbd_combine_dispatch.
+Forward only. The all2alls carry no gradients, so tokens and expert parameters get
+none through rbd_combine_dispatch().
 
 Usage:
     from spec_ep.rbd import rbd_combine_dispatch

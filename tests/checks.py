@@ -113,9 +113,8 @@ def _check_rank(
 ) -> None:
     """Run every variant on one rank for every pilot rule and routing, and check its output.
 
-    Each variant runs with experts that scale their rows by 1 + expert id, and its
-    output is compared with _reference(). A mismatch names the rank, variant, pilot
-    rule and routing.
+    The output is compared with _reference(). A mismatch names the rank, variant,
+    pilot rule and routing.
 
     What each case covers:
         Layouts: 1 node (no pilots), 2 nodes (the smoke layout), 3 nodes (pilots

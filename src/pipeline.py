@@ -18,18 +18,14 @@ Two versions:
         of the plan (finish_plans) runs while they are on the network. Only the stage 1
         all2alls over ep_group are started ahead. A slice's stage 2 over local_group
         and its experts run under the next slice's stage 1.
-    pipelined_plain_combine_dispatch: one row per (token, expert), planned per slice
-        as spec_ep.plain plans a layer.
-
-The plain pipeline plans each slice on its own, so its planning costs `degree` times
-its exchanges and host syncs.
+    pipelined_plain_combine_dispatch: one row per (token, expert). Each slice is
+        planned on its own, as spec_ep.plain plans a layer, so planning costs `degree`
+        times its exchanges and host syncs.
 
 The profiler label of an all2all started without waiting covers both its start and
 its wait. The event clock (spec_ep.phase_clock) sees such an all2all as one comm event
 from its start to its real end, over whatever the stream does meanwhile. Forward only,
 like spec_ep.rbd.
-
-TODO: Plan every slice of the plain pipeline in one exchange and one host sync.
 
 Usage:
     from spec_ep.pipeline import pipelined_rbd_combine_dispatch

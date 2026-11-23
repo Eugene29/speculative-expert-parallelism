@@ -72,7 +72,6 @@ def parse_mode(spec: str, known: tuple[str, ...] = MODES) -> tuple[str, dict[str
     """Split a mode given as name:key=value,key=value.
 
     Args:
-        spec: The mode.
         known: Names to accept. A script with modes of its own passes them too.
 
     Returns:

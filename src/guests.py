@@ -189,8 +189,6 @@ class GuestPool:
         Args:
             shapes: Shape of one expert's part of each weight tensor.
             slots: Experts the pool holds.
-            dtype: Type of the weights.
-            device: The GPU.
         """
         self.weights = [torch.empty((slots, *shape), dtype=dtype, device=device) for shape in shapes]
         self.stream = torch.cuda.Stream(device)

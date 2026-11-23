@@ -19,9 +19,9 @@ layout.
 
 Routing is recorded but the tokens and weights are random. RUN_DIR/experts_rank{r}.pt
 only holds a [num_layers, num_tokens, k] tensor of expert ids for recorded rank r, and
-LAYER picks one layer. Thus, hidden dimension and number of experts are
-hyper-parameters, set by flags and defaulting to Qwen3.6-35B-A3B. The recordings are
-split or joined to fit the ranks, so the global workload stays the same.
+LAYER picks one layer. The token width and the number of experts are therefore set by
+flags, which default to Qwen3.6-35B-A3B. The recordings are split or joined to fit
+the ranks, so the global workload stays the same.
 
 --replicas RULE gives every node --budget replicas of experts it does not hold, before
 anything runs, chosen by spec_ep.replicas.choose_replicas: copies (the busiest, which
