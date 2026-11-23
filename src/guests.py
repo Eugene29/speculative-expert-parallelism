@@ -196,16 +196,24 @@ class GuestPool:
         self.stream = torch.cuda.Stream(device)
         self.started = self.loaded = self.needed = None
 
-    def load(self, sources: list[torch.Tensor], rows: list[int]) -> None:
+    def load(
+        self,
+        sources: list[torch.Tensor],
+        rows: list[int],
+        free: torch.cuda.Event | None = None,
+    ) -> None:
         """Start copying one expert into every slot.
 
         Args:
             sources: Pinned host tensors, one per weight tensor, each [num_rows, *shape].
             rows: Row of the sources to load into each slot; a negative row leaves the
                 slot as it is.
+            free: Event after which nothing reads the pool's old contents. None means
+                now: everything queued on the current stream so far may read them.
         """
-        free = torch.cuda.Event()
-        free.record()
+        if free is None:
+            free = torch.cuda.Event()
+            free.record()
         self.started, self.loaded = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         self.needed = None
         with torch.cuda.stream(self.stream):

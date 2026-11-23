@@ -62,7 +62,7 @@ fi
 # The pipeline on one layer with real feed-forward experts, at the model's expert
 # width and at four times it, where the experts are a larger share of the layer.
 if wants pipe; then
-  pipes="plain rbd rbd_pipe:degree=2 rbd_pipe:degree=3 rbd_pipe:degree=4 plain_pipe"
+  pipes="plain rbd two_lane rbd_pipe:degree=1 rbd_pipe:degree=2 rbd_pipe:degree=3 plain_pipe"
   step pipe_ffn 200 $all $bench 0 --repeats 5 --iterations 2 --expert ffn --modes $pipes
   step pipe_ffn_heavy 200 $all $bench 0 --repeats 5 --iterations 2 --expert ffn \
       --intermediate 2048 --modes $pipes
@@ -71,17 +71,18 @@ fi
 
 # The pipeline in the Qwen model, with the forward as comm and compute events.
 if wants model; then
-  MODEL_MODES=${MODEL_MODES:-"rbd rbd_pipe:degree=2 rbd_pipe:degree=3 rbd_pipe:degree=4 \
-      tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2,per_peer=True"}
+  MODEL_MODES=${MODEL_MODES:-"rbd rbd_pipe:degree=1 rbd_pipe:degree=2 rbd_pipe:degree=3 \
+      two_lane tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2,per_peer=True"}
   LOGS=$OUT/model step model 600 $all $model --repeats 5 --profile events --modes $MODEL_MODES
 fi
 
-# Guest experts in the Qwen model: slots, placement, source, and with the pipeline.
+# Guest experts in the Qwen model: slots, placement, source, and one lane against two.
+# The pinned store takes about 30 GiB of host memory per rank.
 if wants guests; then
-  GUEST_MODES=${GUEST_MODES:-"rbd rbd_guests:slots=4 rbd_guests:slots=8 rbd_guests:slots=16 \
-      rbd_guests:slots=32 rbd_guests:slots=16,placement=redundant \
+  GUEST_MODES=${GUEST_MODES:-"rbd two_lane rbd_guests:slots=4 rbd_guests:slots=8 \
+      rbd_guests:slots=16 rbd_guests:slots=32 rbd_guests:slots=16,placement=redundant \
       rbd_guests:slots=16,source=static rbd_guests:slots=16,source=oracle \
-      rbd_guests:slots=16,source=static,placement=redundant rbd_guests:slots=16,degree=2 autoep"}
-  LOGS=$OUT/guests step guests 900 $all $model --repeats 5 --profile --modes $GUEST_MODES
+      rbd_guests:slots=16,source=static,placement=redundant rbd_guests:slots=16,lanes=1 autoep"}
+  LOGS=$OUT/guests step guests 900 $all $model --repeats 5 --profile events --modes $GUEST_MODES
 fi
 echo "##### done $(date +%T)"

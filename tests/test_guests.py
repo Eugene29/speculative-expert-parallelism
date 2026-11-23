@@ -1,4 +1,4 @@
-"""Integration tests for guest experts (spec_ep.guests) under RBD and its pipeline.
+"""Integration tests for guest experts (spec_ep.guests) under RBD, two-lane and the pipeline.
 
 Every rank takes the layer's own routing as its demand, chooses guests, and runs RBD on
 the relabeled routing, through the check of tests/checks.py. The experts scale a row
@@ -23,6 +23,7 @@ from checks import LAYOUTS, Layout, run_check
 from spec_ep.guests import GuestPool, choose_guests, home_ids, remote_demand
 from spec_ep.pipeline import pipelined_rbd_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
+from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 SLOTS = 3
 
@@ -38,9 +39,9 @@ def _with_guests(
     ep_group: dist.ProcessGroup | None,
     pilot_rule: str,
     unique: bool,
-    degree: int,
+    dispatch: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
-    """RBD, or its pipeline for degree > 1, with guests chosen from the routing itself.
+    """An RBD variant with guests chosen from the routing itself.
 
     Returns:
         output: [num_tokens, H] combined output, to compare with the local reference.
@@ -66,9 +67,6 @@ def _with_guests(
         assert moved.any() == (demand.sum() > 0), "demand for other nodes but no copy moved"
 
     run = lambda rows, ids: expert(rows, home_ids(ids, guests, ep_group))
-    dispatch = rbd_combine_dispatch
-    if degree > 1:
-        dispatch = partial(pipelined_rbd_combine_dispatch, degree=degree)
     return dispatch(
         tokens, weights, run, guests.grown[route], guests.num_experts, G, local_group,
         ep_group=ep_group, pilot_rule=pilot_rule,
@@ -77,11 +75,19 @@ def _with_guests(
 
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_guests_match_local_reference(tmp_path: Path, layout: Layout) -> None:
-    """RBD with unique and with redundant guests gives the locally computed answer."""
+    """Every RBD variant with unique or redundant guests gives the locally computed answer."""
     run_check(tmp_path, layout, {
-        "unique guests": partial(_with_guests, unique=True, degree=1),
-        "redundant guests": partial(_with_guests, unique=False, degree=1),
-        "unique guests, pipeline": partial(_with_guests, unique=True, degree=2),
+        "unique guests": partial(_with_guests, unique=True, dispatch=rbd_combine_dispatch),
+        "redundant guests": partial(_with_guests, unique=False, dispatch=rbd_combine_dispatch),
+        "unique guests, two-lane": partial(
+            _with_guests, unique=True, dispatch=two_lane_rbd_combine_dispatch
+        ),
+        "redundant guests, two-lane": partial(
+            _with_guests, unique=False, dispatch=two_lane_rbd_combine_dispatch
+        ),
+        "unique guests, pipeline": partial(
+            _with_guests, unique=True, dispatch=partial(pipelined_rbd_combine_dispatch, degree=2)
+        ),
     })
 
 

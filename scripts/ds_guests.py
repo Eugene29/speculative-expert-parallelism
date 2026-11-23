@@ -8,11 +8,15 @@ AutoEP layers of scripts/ds_moe.py:
     GuestDispatch: the mode rbd_guests. In MoE layer i every rank
           1. chooses the guests of layer i + 1 and starts loading them from the store
              into the pool that layer i is not using, on a side stream;
-          2. runs RBD (or its pipeline, degree > 1) for layer i on the routing
-             relabeled to the guests chosen during layer i - 1, running a row of a
-             guest with the pool's weights.
-        So a layer's guests load under the previous layer's dispatch, experts and
-        combine, and two pools of `slots` experts are all the GPU memory guests take.
+          2. runs RBD for layer i on the routing relabeled to the guests chosen during
+             layer i - 1, running a row of a guest with the pool's weights. lanes=2
+             (default) is two-lane RBD, which sends the same-node rows that guests
+             create over the node's own communicator; lanes=1 is RBD in one all2all,
+             and degree > 1 its pipeline.
+        So a layer's guests load under the previous layer, and two pools of `slots`
+        experts are all the GPU memory guests take. A predicted choice reaches the
+        host on a side stream and is read after the layer's own host syncs, so
+        choosing adds no sync of its own; its load starts once the layer's experts do.
 
 Where the guests of layer i + 1 come from (source):
     speculative: layer i + 1's router applied to the tokens entering layer i's MoE.
@@ -26,7 +30,7 @@ on the real routing and times every load; see its docstring for the numbers.
 Usage:
     # From scripts/ds_moe.py, for modes such as
     #   rbd_guests:slots=16
-    #   rbd_guests:slots=16,source=static,placement=redundant,degree=2
+    #   rbd_guests:slots=16,source=static,placement=redundant,lanes=1,degree=2
     with keep_remote_experts(gpus_per_node) as store:
         engine = init_deepspeed(model, config)
     mode = GuestDispatch(layers, store, gpus_per_node, local_group, slots=16)
@@ -46,6 +50,7 @@ from deepspeed.moe.ep_experts import GroupedExperts
 from spec_ep.guests import GuestPool, Guests, choose_guests, no_guests, remote_demand
 from spec_ep.pipeline import pipelined_rbd_combine_dispatch
 from spec_ep.rbd import rbd_combine_dispatch
+from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 SOURCES = ("speculative", "static", "oracle")
 PLACEMENTS = ("unique", "redundant")
@@ -100,6 +105,7 @@ class GuestDispatch:
         slots: int = 16,
         source: str = "speculative",
         placement: str = "unique",
+        lanes: int = 2,
         degree: int = 1,
         routing: torch.Tensor | None = None,
     ) -> None:
@@ -113,12 +119,15 @@ class GuestDispatch:
             slots: Guests per rank and layer.
             source: "speculative", "static" or "oracle"; see the module docstring.
             placement: "unique" or "redundant"; see spec_ep.guests.
-            degree: Slices of the RBD pipeline; 1 is plain RBD.
+            lanes: 2 for two-lane RBD, 1 for RBD in one all2all.
+            degree: Slices of the one-lane RBD pipeline; 1 is no pipeline.
             routing: [num_layers, num_tokens, k] recorded experts of this rank, for the
                 static and oracle sources.
         """
         if source not in SOURCES or placement not in PLACEMENTS:
             raise ValueError(f"source must be one of {SOURCES} and placement one of {PLACEMENTS}.")
+        if lanes == 2 and degree > 1:
+            raise ValueError("The pipeline runs on one lane: set lanes=1 with degree > 1.")
         self.layers, self.store, self.slots, self.source = layers, store, slots, source
         self.G, self.ep_group = gpus_per_node, layers[0].ep_group
         self.node_group = local_group if placement == "unique" else None
@@ -127,15 +136,18 @@ class GuestDispatch:
         self.device = layers[0].experts.w1.device
         self.none = no_guests(self.E, slots, self.world, self.device)
         rbd = dict(gpus_per_node=gpus_per_node, local_group=local_group, ep_group=self.ep_group)
-        self.inner = partial(rbd_combine_dispatch, **rbd)
+        self.inner = partial(two_lane_rbd_combine_dispatch if lanes == 2 else rbd_combine_dispatch, **rbd)
         if degree > 1:
             self.inner = partial(pipelined_rbd_combine_dispatch, degree=degree, **rbd)
+        # A predicted choice comes to the host through this stream and buffer.
+        self.reader = torch.cuda.Stream(self.device)
+        self.slot_host = torch.empty(slots, dtype=torch.long).pin_memory()
 
         # Recorded sources know every layer's guests now; a prediction is made per call.
         self.recorded = None
         if source != "speculative":
             guests = [self._choose(layer_routing.to(self.device)) for layer_routing in routing]
-            self.recorded = [(g, self._rows(g)) for g in guests]
+            self.recorded = [(g, self._rows(g.slot_expert)) for g in guests]
         self.pools = self.pool_experts = self.guests = self.predicted = self.stats = None
 
     def acquire(self) -> None:
@@ -170,11 +182,14 @@ class GuestDispatch:
         demand = remote_demand(route, self.E, node, num_nodes)
         return choose_guests(demand, self.slots, self.G, self.node_group, self.ep_group)
 
-    def _rows(self, guests: Guests) -> list[int]:
-        """Row of the store for every slot's expert, -1 for an empty slot. Syncs with the host."""
+    def _rows(self, slot_expert: torch.Tensor) -> list[int]:
+        """Row of the store for every slot's expert, -1 for an empty slot.
+
+        Syncs with the host if slot_expert is on the GPU.
+        """
         per_node = self.L * self.G
         first = self.rank // self.G * per_node
-        return [e if e < first else e - per_node for e in guests.slot_expert.tolist()]
+        return [e if e < first else e - per_node for e in slot_expert.tolist()]
 
     def _dispatch(
         self,
@@ -189,21 +204,31 @@ class GuestDispatch:
         Returns:
             output: [num_tokens, H] the layer's combined output.
         """
+        # Layer i - 1 was the last to read the pool that layer i + 1's guests go into.
         begin = torch.cuda.Event(enable_timing=True)
         begin.record()
         guests, predicted = (self.guests, self.predicted) if i else (self.none, None)
-        if i + 1 < len(self.layers):
-            if self.recorded is not None:
-                self.guests, rows = self.recorded[i + 1]
-            else:
-                following = self.layers[i + 1]
-                self.predicted = following.router.forward(tokens, following.expert_bias)[1]
-                self.guests = self._choose(self.predicted)
-                rows = self._rows(self.guests)
-            self.pools[(i + 1) % 2].load(self.store[i + 1], rows)
+        last, read = i + 1 == len(self.layers), None
+        if not last and self.recorded is not None:
+            self.guests, rows = self.recorded[i + 1]
+            self.pools[(i + 1) % 2].load(self.store[i + 1], rows, begin)
+        elif not last:
+            following = self.layers[i + 1]
+            self.predicted = following.router.forward(tokens, following.expert_bias)[1]
+            self.guests = self._choose(self.predicted)
+            chosen, read = torch.cuda.Event(), torch.cuda.Event()
+            chosen.record()
+            with torch.cuda.stream(self.reader):
+                self.reader.wait_event(chosen)
+                self.slot_host.copy_(self.guests.slot_expert, non_blocking=True)
+                read.record()
 
         run = partial(self._run_experts, self.layers[i], i % 2)
         output = self.inner(tokens, weights, run, guests.grown[route], guests.num_experts)
+        if read is not None:
+            # The layer's own syncs came after the choice, so this returns at once.
+            read.synchronize()
+            self.pools[(i + 1) % 2].load(self.store[i + 1], self._rows(self.slot_host), begin)
         if self.stats is not None and i:
             end = torch.cuda.Event(enable_timing=True)
             end.record()
