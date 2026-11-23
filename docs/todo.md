@@ -57,7 +57,7 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 - [ ] A cheaper `make_plan`. This is the largest item left: 72 ms of a 516 ms two-lane
   forward of the 35B model, 1.8 ms per layer of host time whatever the batch, where
   DeepEP's plan takes 2.2 ms per forward (Guests 02). It is why RBD loses to plain
-  below about 1,500 tokens per rank (Guests 02).
+  at 1024 tokens per rank and below (Guests 02).
 - [ ] A plain fallback for small batches, chosen by `benchmark/rbd_benefit.py`'s saved
   rows: under about 35,000 saved rows per layer the plan costs more than RBD saves.
 - [ ] The event totals of the guest modes. Their comm and compute inside the MoE
@@ -134,13 +134,13 @@ Finished items move here with the date and where the result is written up.
   with and without guests. It is slower than two-lane without slices on the 35B model
   and 1% faster on the 122B model (Guests 02).
 - [x] 2026-11-22. Few tokens per rank, and how activation spreads with batch size:
-  plain wins below about 1,500 tokens per rank, and static prefetch beats speculative
+  plain wins at 128 to 1024 tokens per rank (the fit puts the break-even near 1,500, not measured), and static prefetch beats speculative
   there (Guests 02).
 - [x] 2026-11-22. A metric for RBD's benefit, the saved rows
   (`benchmark/rbd_benefit.py`), and guests chosen by the pilots they remove
   (`choose_guests_by_pilots`), which gained nothing end to end (Guests 02).
 - [x] 2026-11-22. Guests on Qwen3.5-122B-A10B: the store is striped, pinned in shared
-  chunks and releases its source pages, 89.5 GiB of host memory per rank (Guests 02).
+  chunks and releases its source pages, 85.4 GiB of host memory per rank (Guests 02).
 
 - [x] 2026-11-22. Why pipelining gained nothing for Tutel and RBD, and one plan for
   all slices of the RBD pipeline, with its tail under the dispatch: 1.134x over RBD
