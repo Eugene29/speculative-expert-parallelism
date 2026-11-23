@@ -25,7 +25,7 @@ outputs are not needed before the pilot sums are back. So the experts run on a s
 `early` of the direct rows while the pilots travel out, and on the rest while the
 pilot sums travel back. No transfer is added and the expert function is called up to
 three times. NCCL moves rows with GPU kernels of its own, which slow down under the
-experts as the experts do under them, so most of the overlap is paid back: on the 400B
+experts, and splitting the expert call has a cost of its own, so most of the overlap is paid back: on the 400B
 model's first 30 layers on 2 nodes, 170 ms of overlap per forward bought 33 ms.
 
 The slice pipeline (`src/pipeline.py`, commit c730d7e) was removed: it lost to two-lane
