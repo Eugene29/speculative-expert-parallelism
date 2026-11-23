@@ -92,7 +92,8 @@ import os
 import statistics
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 
 import deepspeed
@@ -102,7 +103,7 @@ from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 from torch.profiler import record_function
 from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 
-from benchmark.all2all.modes import MODES, Mode, build_mode, parse_mode
+from benchmark.all2all.modes import GROUPED, MODES, Mode, build_mode, parse_mode
 from spec_ep.phase_clock import Event, PhaseClock, Totals, totals, write_trace
 
 from ds_guests import GuestDispatch
@@ -185,14 +186,53 @@ def init_deepspeed(
     return engine
 
 
-def set_mode(engine: deepspeed.DeepSpeedEngine, mode: Mode | GuestDispatch | None) -> None:
+def grouped_experts(layer: AutoEPMoELayer) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Build a layer's expert function for rows that arrive grouped by expert, ids ascending.
+
+    The layer's own function sorts its rows by expert and puts the outputs back, a
+    gather and a scatter of every row. A mode that hands the rows over grouped needs
+    neither.
+
+    Returns:
+        run: Maps [num_rows, H] rows and their [num_rows] expert ids to the outputs.
+    """
+    first = torch.distributed.get_rank(layer.ep_group) * layer.num_local_experts
+
+    def run(rows: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
+        counts = torch.zeros(layer.num_local_experts, dtype=torch.int32, device=rows.device)
+        counts.scatter_add_(0, expert_ids - first, torch.ones_like(expert_ids, dtype=torch.int32))
+        return layer.experts(rows, counts)
+
+    return run
+
+
+def set_mode(
+    engine: deepspeed.DeepSpeedEngine,
+    mode: Mode | GuestDispatch | None,
+    grouped: bool = False,
+) -> None:
     """Make every AutoEP layer dispatch and combine through mode; None is its own path.
 
-    A GuestDispatch gives every layer its own function.
+    A GuestDispatch gives every layer its own function. A grouped mode hands the
+    experts rows grouped by expert, so it gets grouped_experts() of the layer.
     """
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
     for i, layer in enumerate(layers):
         layer.combine_dispatch = mode.for_layer(i) if isinstance(mode, GuestDispatch) else mode
+        if grouped:
+            layer.combine_dispatch = partial(_with_experts, mode, grouped_experts(layer))
+
+
+def _with_experts(
+    mode: Mode,
+    run: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    tokens: torch.Tensor,
+    weights: torch.Tensor,
+    expert: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    route: torch.Tensor,
+) -> torch.Tensor:
+    """Call a mode with `run` in place of the expert function the layer passes."""
+    return mode(tokens, weights, run, route)
 
 
 def get_batch(
@@ -494,6 +534,7 @@ def main() -> None:
     full_collections = watch_full_collections()
 
     known = (*MODES, GUESTS)
+    grouped = lambda spec: parse_mode(spec, known)[0] in GROUPED
     guest_settings = {
         spec: parse_mode(spec, known)[1] for spec in args.modes if parse_mode(spec, known)[0] == GUESTS
     }
@@ -541,7 +582,7 @@ def main() -> None:
         # One untimed forward per mode: warms it up and checks its logits.
         first, reference = args.modes[0], None
         for spec, mode in modes.items():
-            set_mode(engine, mode)
+            set_mode(engine, mode, grouped(spec))
             torch.cuda.reset_peak_memory_stats(engine.device)
             seconds, tail = timed_forward(engine, batch)
             peak = torch.tensor(torch.cuda.max_memory_allocated(engine.device) / 2**30,
@@ -568,7 +609,7 @@ def main() -> None:
         rows, clock = {}, PhaseClock()
         for round in range(args.repeats):
             for spec, mode in modes.items():
-                set_mode(engine, mode)
+                set_mode(engine, mode, grouped(spec))
                 calls[spec].append(timed_forward(engine, batch)[0])
                 if "events" in args.profile:
                     seconds, events = traced_forward(engine, batch, clock)
@@ -594,7 +635,7 @@ def main() -> None:
 
         collections.append(len(full_collections))
         for spec, mode in modes.items():
-            set_mode(engine, mode)
+            set_mode(engine, mode, grouped(spec))
             if "torch" in args.profile:
                 seconds = run_pytorch_profile(engine, batch, spec, args.trace_ranks)
                 print0(f"{spec:>{width}}: profiled {seconds:7.3f} s "

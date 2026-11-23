@@ -39,7 +39,7 @@ The Tutel, DeepSpeed, X-MoE and DeepEP adapters are imported only when their mod
 built, so a run without them needs none of those libraries.
 
 Usage:
-    from benchmark.all2all.modes import MODES, NEED_TWO_NODES, PADDED, build_mode, parse_mode
+    from benchmark.all2all.modes import GROUPED, MODES, NEED_TWO_NODES, PADDED, build_mode, parse_mode
     mode = build_mode("tutel:capacity_factor=1,degree=2", num_experts, gpus_per_node, local_group)
     output = mode(tokens, weights, expert, route)
 """
@@ -58,6 +58,8 @@ MODES = (
     "plain", "plain_fused", "rbd", "two_lane", "autoep", "tutel", "ds_moe", "xmoe", "deepep",
 )
 NEED_TWO_NODES = {"rbd", "two_lane", "xmoe"}
+# Modes that call the expert function with rows grouped by expert, ids ascending.
+GROUPED = {"rbd", "two_lane"}
 PADDED = {"tutel", "ds_moe"}
 
 Expert = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]

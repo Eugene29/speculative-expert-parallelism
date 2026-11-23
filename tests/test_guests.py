@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 import torch.multiprocessing as mp
 
-from checks import EXPERTS_PER_RANK, GPUS_PER_NODE, LAYOUTS, Layout, run_check
+from checks import EXPERTS_PER_RANK, GPUS_PER_NODE, LAYOUTS, Layout, run_check, scale_by_expert
 from spec_ep.guests import (
     GuestPool,
     choose_guests,
@@ -87,7 +87,11 @@ def _with_guests(
         assert (served_by[moved] == rank).all(), "a copy moved to another rank's guest"
         assert moved.any() == (demand.sum() > 0), "demand for other nodes but no copy moved"
 
-    run = lambda rows, ids: expert(rows, home_ids(ids, guests, ep_group))
+    def run(rows: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """Scale rows by their original expert; a rank's guests come after its own experts."""
+        assert (ids.diff() >= 0).all(), "the experts' rows are not grouped by expert"
+        return scale_by_expert(rows, home_ids(ids, guests, ep_group))
+
     return dispatch(
         tokens, weights, run, guests.grown[route], guests.num_experts, G, local_group,
         ep_group=ep_group, pilot_rule=pilot_rule,

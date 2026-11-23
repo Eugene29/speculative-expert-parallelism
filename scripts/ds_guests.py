@@ -278,23 +278,20 @@ class GuestDispatch:
         """Run rows through this rank's experts and its guests, by their grown ids.
 
         The layer's expert call over L + slots experts, the last slots of them in the
-        pool's tensors, once the guests have arrived. No host sync.
+        pool's tensors, once the guests have arrived. RBD hands over the rows grouped
+        by id, so there is no sort and no host sync.
 
         Returns:
             outputs: [num_inputs, H] expert outputs, in the order of rows.
         """
         local = grown_ids - self.rank * (self.L + self.slots)
-        order = local.argsort(stable=True)
         sizes = torch.zeros(self.L + self.slots, dtype=torch.int32, device=rows.device)
         sizes.scatter_add_(0, local, torch.ones_like(local, dtype=torch.int32))
         starts = (sizes.cumsum(0) - sizes).int()
-        x = rows[order]
         self.pool.wait()
         gate, down, up = ([own, guest] for own, guest in zip(_weights(layer), held))
-        hidden = swiglu(_grouped_mm(x, gate, starts, sizes), _grouped_mm(x, up, starts, sizes))
-        outputs = rows.new_empty(rows.shape)
-        outputs[order] = _grouped_mm(hidden, down, starts, sizes)
-        return outputs
+        hidden = swiglu(_grouped_mm(rows, gate, starts, sizes), _grouped_mm(rows, up, starts, sizes))
+        return _grouped_mm(hidden, down, starts, sizes)
 
     def _score(
         self,

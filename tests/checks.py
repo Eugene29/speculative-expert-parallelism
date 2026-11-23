@@ -6,7 +6,8 @@ loops over every variant, pilot rule and routing inside the workers, since start
 the processes costs far more than one call.
 
 Each expert scales its rows by 1 + expert id, so a row sent to the wrong expert,
-merged into the wrong token or given the wrong weight changes the output. The
+merged into the wrong token or given the wrong weight changes the output. The expert
+function also checks that its rows come grouped by expert. The
 expected output needs no communication, so every rank checks its own tokens.
 Everything runs in float64, so the match is exact up to rounding.
 
@@ -95,12 +96,18 @@ ROUTINGS: dict[str, Callable[[torch.Generator, int, int], torch.Tensor]] = {
 }
 
 
-def _scale_by_expert(rows: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
+def scale_by_expert(rows: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
     return rows * (1.0 + expert_ids.double()).unsqueeze(-1)
 
 
+def _grouped_experts(rows: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
+    """scale_by_expert, after checking that RBD hands over rows grouped by expert."""
+    assert (expert_ids.diff() >= 0).all(), "the experts' rows are not grouped by expert"
+    return scale_by_expert(rows, expert_ids)
+
+
 def _reference(tokens: torch.Tensor, weights: torch.Tensor, route: torch.Tensor) -> torch.Tensor:
-    """Expected output with _scale_by_expert experts, computed locally."""
+    """Expected output with scale_by_expert experts, computed locally."""
     scale = (weights.double() * (1.0 + route.double())).sum(dim=1, keepdim=True)
     return tokens * scale
 
@@ -156,7 +163,7 @@ def _check_rank(
                     output = combine_dispatch(
                         tokens,
                         weights,
-                        _scale_by_expert,
+                        _grouped_experts,
                         route,
                         num_experts=E,
                         gpus_per_node=GPUS_PER_NODE,
