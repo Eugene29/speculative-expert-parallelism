@@ -62,7 +62,7 @@ model="$PY -u scripts/ds_moe.py --config-pth configs/qwen_ep$((4 * N)).json --mo
 if wants plan; then
   for tree in ${OLD:+old:$OLD} new:$REPO; do
     for world in 8 16; do
-      step plan_${tree%%:*}_$world 120 ${tree#*:} $one $PY -u benchmark/plan_cost.py --world $world
+      step plan_${tree%%:*}_$world 120 ${tree#*:} $one $PY -u benchmark/plan_cost.py --world $world --parts
     done
   done
 fi

@@ -193,7 +193,8 @@ def _deal(
 
     grown = torch.cat([_home_ids(E, world, slots, hot.device), seat_id.new_empty(1)])
     grown[hot] = seat_id
-    return Guests(torch.where(hot < E, hot, -1)[rank - first :: stripes], grown[:E], world * (L + slots))
+    mine = torch.where(hot < E, hot, -1)[rank - first :: stripes].contiguous()  # NCCL sends it
+    return Guests(mine, grown[:E], world * (L + slots))
 
 
 def pilot_credit(

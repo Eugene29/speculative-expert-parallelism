@@ -9,8 +9,12 @@ GPU drained before it. The defaults are a layer of Qwen3.5-397B-A17B on 2 nodes.
 It also runs against the tree before the kernel plan (commit c730d7e, start_plans and
 finish_plan), which is how the two were compared.
 
+With --parts it then splits the source half of the kernel plan: the kernel's launch on
+the host, the kernel on the GPU, and everything after the kernel, which is the torch
+operations, the exchange and the host sync.
+
 Usage:
-    python -m benchmark.plan_cost [--world 16]
+    python -m benchmark.plan_cost [--world 16] [--parts]
     PYTHONPATH=<old tree>/.deps python benchmark/plan_cost.py
 """
 import argparse
@@ -28,6 +32,7 @@ parser.add_argument("--experts", type=int, default=512)
 parser.add_argument("--k", type=int, default=10)
 parser.add_argument("--tokens", type=int, default=4096)
 parser.add_argument("--hidden", type=int, default=4096)
+parser.add_argument("--parts", action="store_true", help="Split the source half by part")
 args = parser.parse_args()
 W, G, E, K, T, H = args.world, 4, args.experts, args.k, args.tokens, args.hidden
 dev = torch.device("cuda")
@@ -98,3 +103,32 @@ for lanes in (1, 2):
     print(f"{'kernel' if NEW else 'old'} plan, world {W}, E {E}, k {K}, {T} tokens, lanes {lanes}: "
           f"source half {a:.0f} us, receiving half {b:.0f} us, both {a + b:.0f} us "
           f"(median of 200; {sum(plan.send1)} stage 1 rows, {sum(plan.send2)} stage 2 rows)")
+
+if args.parts and NEW:
+    import triton
+
+    L = E // W
+    C = L + 1 + 2 * G * L
+
+    def kernel(sync: bool) -> float:
+        """Median microseconds of the plan kernel alone, to its launch or to its end on the GPU."""
+        times = []
+        for _ in range(230):
+            counts = torch.zeros(W * C + 1, dtype=torch.long, device=dev)
+            bucket, slot = torch.empty((2, T, K), dtype=torch.long, device=dev)
+            final_weight = torch.empty((T, K), device=dev)
+            meta = torch.empty((T, 2 * K), dtype=torch.int32, device=dev)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            rbd._plan_kernel[(triton.cdiv(T, rbd._BLOCK),)](
+                routes[0], weights[0], counts, bucket, slot, final_weight, meta, T, 0, G, L, C,
+                W * C, K=K, RAIL=True, BLOCK=rbd._BLOCK,
+            )
+            if sync:
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1e6)
+        return statistics.median(times[30:])
+
+    launch, done = kernel(False), kernel(True)
+    print(f"source half by part, world {W}: kernel launch on the host {launch:.0f} us, kernel on "
+          f"the GPU {done - launch:.0f} us, the rest {a - done:.0f} us of {a:.0f} us")
