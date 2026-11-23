@@ -52,6 +52,11 @@ covered. And the transfers and the experts share the GPU: NCCL moves rows with i
 kernels, so each runs slower while the other does
 (`benchmark/all2all/contention.py` measures by how much).
 
+With `lanes=2` the RBD pipeline sends every slice's stage 1 in the two lanes of
+`two_lane.py`: `two_lane_all2all_async` starts both lanes without waiting, and each
+finished plan goes through `two_lane_plan`. In the Qwen model it is slower than
+two-lane without slices (0.534 s against 0.516 s, Pipeline 02).
+
 ## Guests: `src/guests.py`
 
 A guest is an expert of another node that a rank runs itself for one layer, from
@@ -61,9 +66,13 @@ guests of the experts a node asks other nodes for most remove pilots.
 1. `remote_demand` counts how often a rank's tokens ask for each expert of another
    node, in any routing: the layer's own, a recording, or a prediction.
 2. `choose_guests` makes the experts in most demand guests. Unique placement adds the
-   demand of a node's ranks and deals the hottest experts over them, so no two ranks
-   of a node load the same one. Redundant placement lets every rank take its own
-   hottest experts, with no collective.
+   demand of a node's ranks, and the node's rank q takes the hottest experts e with
+   `e % G == q`. No two ranks of a node load the same one, and a rank only ever hosts
+   one remote expert in G, so its host store is that much smaller. Redundant placement
+   lets every rank take its own hottest experts, with no collective.
+   `choose_guests_by_pilots` ranks experts by `pilot_credit`, the pilots a guest of
+   them helps remove, in a few rounds. It leaves 3 to 7% fewer pilots than demand and
+   costs more than that saves when it runs per layer (Placement 01).
 3. A guest is a new expert id after its rank's own experts, the numbering of
    `replicas.py`, so `rbd_combine_dispatch` and the pipeline run unchanged on
    `Guests.grown[route]`.

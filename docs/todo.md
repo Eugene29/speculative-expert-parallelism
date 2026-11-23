@@ -54,9 +54,15 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
   the guests begin.
 - [ ] Guests' weights in one buffer per expert. A load is three copies per guest, one
   per weight tensor, each a call on the host.
-- [ ] A cheaper `make_plan`. It is about a quarter of an RBD round trip, mostly
-  host time.
-- [ ] The pipeline over two-lane.
+- [ ] A cheaper `make_plan`. This is the largest item left: 72 ms of a 516 ms two-lane
+  forward of the 35B model, 1.8 ms per layer of host time whatever the batch, where
+  DeepEP's plan takes 2.2 ms per forward (Profiles 04). It is why RBD loses to plain
+  below about 1,500 tokens per rank (Placement 01).
+- [ ] A plain fallback for small batches, chosen by `benchmark/rbd_benefit.py`'s saved
+  rows: under about 35,000 saved rows per layer the plan costs more than RBD saves.
+- [ ] The event totals of the guest modes. Their comm and compute inside the MoE
+  layers add up to more than the forward, because a guest load shows as a long
+  in-flight transfer; only their per-step rows are usable (Profiles 04).
 - [ ] RBD in one all2all with replicas is slower than without (5.6 to 6.1 ms on 2
   nodes at 8 channels per peer). The lead: the communicator of all ranks has 8 p2p
   channels in total against the node communicator's 32 (NCCL 01).

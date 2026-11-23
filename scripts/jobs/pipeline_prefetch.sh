@@ -147,17 +147,25 @@ if wants others; then
   LOGS=$OUT/profile_others step profile_others 480 $deepep_env $all -c 32 $model $events \
       --modes $OTHERS
 fi
-# A bigger model (BIG, on 80 GB GPUs): the same two profiles. Its experts are three
-# times the size, so a layer has time to load fewer guests: B slots, and half of them.
+# A bigger model (BIG, on 80 GB GPUs) in three steps: RBD and its pipelines, then
+# guests, then the other libraries. Guests have their own step because their store
+# takes the most host memory: a step killed for memory loses only its own modes. The
+# experts are three times the size, so a layer has time to load fewer guests: B slots,
+# and half of them.
+BIG=${BIG:-/pscratch/sd/e/eku/spec_ep/models/Qwen3.5-122B-A10B}
+B=${BIG_SLOTS:-16}
 if wants big; then
-  BIG=${BIG:-/pscratch/sd/e/eku/spec_ep/models/Qwen3.5-122B-A10B}
-  B=${BIG_SLOTS:-16}
-  BIG_OURS=${BIG_OURS:-"autoep plain rbd two_lane rbd_pipe:degree=2 rbd_pipe:degree=2,lanes=2 \
-      rbd_guests:slots=$((B / 2)) rbd_guests:slots=$B rbd_guests:slots=$((B / 2)),degree=2 \
-      rbd_guests:slots=$B,degree=2 rbd_guests:slots=$B,source=static \
-      rbd_guests:slots=$B,choice=pilots"}
-  LOGS=$OUT/big_ours step big_ours 1200 $all $model --model $BIG $events --modes $BIG_OURS
-  LOGS=$OUT/big_others step big_others 1000 $deepep_env $all -c 32 $model --model $BIG $events \
+  BIG_OURS=${BIG_OURS:-"autoep plain rbd two_lane rbd_pipe:degree=2 rbd_pipe:degree=2,lanes=2"}
+  LOGS=$OUT/big_ours step big_ours 900 $all $model --model $BIG $events --modes $BIG_OURS
+fi
+if wants big_guests; then
+  BIG_GUESTS=${BIG_GUESTS:-"two_lane rbd_guests:slots=$((B / 2)) rbd_guests:slots=$B \
+      rbd_guests:slots=$((B / 2)),degree=2 rbd_guests:slots=$B,degree=2 \
+      rbd_guests:slots=$B,source=static"}
+  LOGS=$OUT/big_guests step big_guests 900 $all $model --model $BIG $events --modes $BIG_GUESTS
+fi
+if wants big_others; then
+  LOGS=$OUT/big_others step big_others 900 $deepep_env $all -c 32 $model --model $BIG $events \
       --modes $OTHERS
 fi
 echo "##### done $(date +%T)"

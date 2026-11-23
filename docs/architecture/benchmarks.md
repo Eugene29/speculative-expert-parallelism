@@ -13,6 +13,9 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 | `benchmark/all2all/contention.py` | One all2all and one expert block, alone and overlapped on every rank: how much each slows the other, and what share of the experts a pipeline can hide. |
 | `benchmark/replica_count.py` | The rows that cross between nodes under every replica rule, budget and routing, on recorded routing. CPU only. |
 | `benchmark/hot_experts.py` | How stable the hot experts are from batch to batch, on recorded routing. CPU only. |
+| `benchmark/activation_spread.py` | How widely tokens spread over the experts at different batch sizes, and the pilots that guests leave at each, on recorded routing. |
+| `benchmark/rbd_benefit.py` | The rows RBD saves between nodes for a routing and a placement, and the fit of RBD's measured gain to them over several model steps. CPU only. |
+| `scripts/login_dry_run.py` | Any of these scripts on the login node over gloo, to check that code runs and modes agree. Timings mean nothing there. |
 | `benchmark/trace_report.py` | Where the GPU time of a `combine_dispatch --trace` run went, as a table and a timeline picture. CPU only. |
 | `benchmark/all2all/even_vs_uneven.py` | One all2all with the recorded (uneven) split sizes against even ones. |
 | `benchmark/internode/expert_all2all.py` | All2all of expert weights across nodes. |

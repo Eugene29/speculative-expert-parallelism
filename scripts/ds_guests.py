@@ -40,6 +40,8 @@ Usage:
     layers[i].combine_dispatch = mode.for_layer(i)
 """
 import contextlib
+import ctypes
+import os
 import statistics
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -63,7 +65,47 @@ from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 SOURCES = ("speculative", "static", "oracle")
 PLACEMENTS = ("unique", "redundant")
+_LIBC, _MADV_DONTNEED = ctypes.CDLL("libc.so.6"), 4
 Store = list[list[torch.Tensor]]  # per MoE layer: w1, w2, w3 of the other nodes' experts
+
+
+class _PinnedArena:
+    """Page-locked host memory, handed out as views of large chunks.
+
+    torch rounds every pinned allocation up to a power of two: a 192 MiB tensor takes
+    256 MiB. A chunk is a power of two that holds about 16 tensors, so little is lost.
+    """
+
+    def __init__(self) -> None:
+        self.chunk, self.used = torch.empty(0, dtype=torch.uint8), 0
+
+    def put(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Copy a tensor into page-locked memory.
+
+        Returns:
+            pinned: The copy, a view of the current chunk.
+        """
+        size = tensor.numel() * tensor.element_size()
+        if self.used + size > self.chunk.numel():
+            self.chunk = torch.empty(1 << (16 * size - 1).bit_length(), dtype=torch.uint8,
+                                     pin_memory=True)
+            self.used = 0
+        pinned = self.chunk[self.used : self.used + size].view(tensor.dtype).view(tensor.shape)
+        self.used += size
+        return pinned.copy_(tensor)
+
+
+def _release_pages(tensor: torch.Tensor) -> None:
+    """Tell the kernel the whole pages under a tensor need not stay in memory.
+
+    The model's weights are mapped from its file. An expert that was read once to be
+    copied would otherwise stay resident next to its copy.
+    """
+    page = os.sysconf("SC_PAGE_SIZE")
+    start = -(-tensor.data_ptr() // page) * page
+    length = (tensor.data_ptr() + tensor.numel() * tensor.element_size() - start) // page * page
+    if length > 0:
+        _LIBC.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_DONTNEED)
 
 
 @contextlib.contextmanager
@@ -86,17 +128,24 @@ def keep_remote_experts(gpus_per_node: int, stripe: int = 1) -> Iterator[Store]:
     """
     repack = auto_ep_layer.repack_expert_weights
     store: Store = []
+    arena = _PinnedArena()
 
     def repack_and_keep(experts_source, spec, ep_rank: int, ep_size: int) -> tuple[torch.Tensor, ...]:
         # One expert per call, so a rank reads only the experts it keeps: reading a
         # whole node's experts of a 122B model put 136 GiB in every rank's memory.
         E = spec.num_experts
         per_node = E // (ep_size // gpus_per_node)
-        kept = [
-            repack(experts_source, spec, e, E) for e in range(E)
+        remote = [
+            e for e in range(E)
             if e // per_node != ep_rank // gpus_per_node and e % stripe == ep_rank % stripe
         ]
-        store.append([torch.cat(parts).pin_memory() for parts in zip(*kept)])
+        kept = [repack(experts_source, spec, e, E) for e in remote]
+        store.append([arena.put(torch.cat(parts)) for parts in zip(*kept)])
+        if spec.expert_storage == "fused_3d":
+            names = (spec.expert_w1_name, spec.expert_w2_name, spec.expert_w3_name)
+            for source in (getattr(experts_source, name).data for name in names if name):
+                for e in remote:
+                    _release_pages(source[e])
         return repack(experts_source, spec, ep_rank, ep_size)
 
     auto_ep_layer.repack_expert_weights = repack_and_keep

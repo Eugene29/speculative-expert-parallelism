@@ -138,16 +138,18 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--slots", type=int, nargs="+", default=[8, 24], help="Guests per rank")
     parser.add_argument("--layers", type=int, nargs="+", default=list(range(0, 40, 4)))
+    parser.add_argument("--static-from", help="Directory of the other batch, for the static "
+                        "guests. Default: the recordings of run_dir after the ones scored")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     columns = {}
     for setting in args.settings:
         sequences, length = map(int, setting.split("x"))
-        batch, other = (
-            load_batch(args.run_dir, first, args.ranks, sequences, length, args.layers, device)
-            for first in (0, args.ranks * sequences)
-        )
+        shape = (args.ranks, sequences, length, args.layers, device)
+        batch = load_batch(args.run_dir, 0, *shape)
+        other = load_batch(args.static_from or args.run_dir,
+                           0 if args.static_from else args.ranks * sequences, *shape)
         columns[setting] = spread(batch, other, args.num_experts, args.gpus_per_node, args.slots)
 
     print(f"| mean over layers {args.layers} | " + " | ".join(columns) + " |")
