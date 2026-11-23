@@ -55,7 +55,7 @@ kernels, so each runs slower while the other does
 With `lanes=2` the RBD pipeline sends every slice's stage 1 in the two lanes of
 `two_lane.py`: `two_lane_all2all_async` starts both lanes without waiting, and each
 finished plan goes through `two_lane_plan`. In the Qwen model it is slower than
-two-lane without slices (0.534 s against 0.516 s, Pipeline 02).
+two-lane without slices (0.534 s against 0.516 s, Guests 02).
 
 ## Guests: `src/guests.py`
 
@@ -72,7 +72,7 @@ guests of the experts a node asks other nodes for most remove pilots.
    lets every rank take its own hottest experts, with no collective.
    `choose_guests_by_pilots` ranks experts by `pilot_credit`, the pilots a guest of
    them helps remove, in a few rounds. It leaves 3 to 7% fewer pilots than demand and
-   costs more than that saves when it runs per layer (Placement 01).
+   costs more than that saves when it runs per layer (Guests 02).
 3. A guest is a new expert id after its rank's own experts, the numbering of
    `replicas.py`, so `rbd_combine_dispatch` and the pipeline run unchanged on
    `Guests.grown[route]`.
