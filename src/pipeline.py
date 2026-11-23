@@ -22,7 +22,9 @@ Each slice is planned on its own, so planning costs `degree` times its exchanges
 host syncs. Slice c is on the network while the host plans slice c + 1.
 
 The profiler label of an all2all started without waiting covers both its start and
-its wait. Forward only, like spec_ep.rbd.
+its wait. The event clock (spec_ep.phase_clock) sees such an all2all as one comm event
+from its start to its real end, over whatever the stream does meanwhile. Forward only,
+like spec_ep.rbd.
 
 TODO: Plan every slice in one exchange and one host sync.
 
@@ -146,7 +148,8 @@ def _make_plain_plan(
 
     send = copy_rank.bincount(minlength=world)
     recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send, group=ep_group)
+    with record_function("comm/both"):
+        dist.all_to_all_single(recv, send, group=ep_group)
     send, recv = send.tolist(), recv.tolist()
     expert_ids = all2all(copy_expert[order], send, recv, ep_group)
 

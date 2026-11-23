@@ -9,8 +9,19 @@ Each experiment is written up as one Notion page under
 | [Baselines 01](https://app.notion.com/p/41fe2e64355e81359858e05464b6fdf3): settings for Tutel, DeepSpeed's MOELayer and DeepEP | `benchmark/all2all/combine_dispatch.py`, `benchmark/all2all/baselines.py`, `benchmark/trace_report.py` | `deepep`, `tutel`, `deepep2` | `logs/2026-11-21_exp/`, `logs/2026-11-21_exp2/` |
 | [Hot experts 01](https://app.notion.com/p/41fe2e64355e81a5bc76ce61b9f7c9fb): hot experts across batches, static against dynamic | `scripts/record_routing.py`, `benchmark/hot_experts.py`, `combine_dispatch.py --hot` | `record`, `hot` | `logs/2026-11-21_exp/routing/`, `hot_*.out` in `logs/2026-11-21_exp4/` and `_exp5/` |
 | [Expert loading 01](https://app.notion.com/p/41fe2e64355e8156b2a6c6f82ee2d6ed): host memory against other GPUs | `benchmark/internode/expert_load.py` | `load1`, `load` | `load_*.out` in `logs/2026-11-21_exp/`, `_exp2/`, `_exp3/` |
+| [Tutel 01](https://app.notion.com/p/420e2e64355e81c199c9fc98de3d0897): why Tutel's pipelining is slower than one all2all | `benchmark/all2all/baselines.py` (`per_peer`), `/pscratch/sd/e/eku/tutel_pipeline/a2a_chunks.py`, `scripts/ds_moe.py --modes` | `pipe`, `tutel`, `model` of `baselines_replicas.sh` | `logs/2026-11-22_exp/2n/` |
+| [NCCL 01](https://app.notion.com/p/420e2e64355e81058ee0e7b7b340b1e8): why same-node rows were slow in the all2all of all ranks | `benchmark/all2all/combine_dispatch.py` under `NCCL_NCHANNELS_PER_NET_PEER` | `channels` of `baselines_replicas.sh` | `logs/2026-11-22_exp/2n_b/channels_*.out` |
+| [Baselines 02](https://app.notion.com/p/420e2e64355e811297aedc8c3e809a9b): six libraries on 2 and 4 nodes, one layer and the Qwen model | `benchmark/all2all/modes.py`, `combine_dispatch.py`, `baselines.py`, `xmoe.py`, `scripts/ds_moe.py --modes` | `micro`, `xmoe`, `deepep`, `model`, `model_deepep`, `model_tuned` | `logs/2026-11-22_exp/2n/`, `2n_b/`, `2n_c/`, `2n_d/`, `4n/`, `4n_b/` |
+| [Hot experts 02](https://app.notion.com/p/420e2e64355e81908ec8f17b64650cd4): replicas chosen to cut each node's inter-node rows | `src/replicas.py`, `benchmark/replica_count.py`, `combine_dispatch.py --replicas` | `replicas` | `logs/2026-11-22_exp/replica_count_*.out`, `2n_c/replicas_*.out`, `4n/replicas_*.out` |
+| [Profiles 01](https://app.notion.com/p/420e2e64355e81119062fadf3fe9c99f): where each library's time goes, on one layer and in the Qwen model | `benchmark/trace_report.py`, `combine_dispatch.py --trace`, `scripts/ds_moe.py --profile torch` | `micro`, `xmoe`, `deepep`, `model`, `model_deepep`, `model_tuned` | `traces/`, `model*/traces/`, `trace_report_*_rank0.txt` under `logs/2026-11-22_exp/*/` |
+| [Profiles 02](https://app.notion.com/p/420e2e64355e81e09a34f2483ac1758e): each component's latency in the Qwen model, timed with CUDA events | `benchmark/phase_clock.py`, `scripts/ds_moe.py --profile phases`, `benchmark/summarize.py --by phase` | `model`, `model_deepep` | `logs/2026-11-22_trace/2n/`, the stall probe in `logs/2026-11-22_trace/probe/` |
+| [Redundancy 01](https://app.notion.com/p/420e2e64355e81c0a5f8eb597ad11b4e): cover routing, raising token redundancy across all nodes | `src/replicas.py` (`cover`, `ring`, `serving_node(cover=True)`), `benchmark/replica_count.py` | `replicas`, `channels` on 4 nodes | `logs/2026-11-22_exp/replica_count_4nodes.out`, `4n/replicas_*.out` |
+| [DeepEP 01](https://app.notion.com/p/420e2e64355e813c9eb9fa41bae40e34): DeepEP across nodes on Perlmutter | `patches/`, `benchmark/all2all/baselines.py` (`deepep`) | `deepep`, `model_deepep` | `/pscratch/sd/e/eku/deepep_multinode/logs/job_61768851/` |
 
-The job steps are those of `scripts/jobs/baselines_hot_load.sh`, picked with `STEPS`.
+The job steps of the first three pages are those of `scripts/jobs/baselines_hot_load.sh`, and
+the later ones those of `scripts/jobs/baselines_replicas.sh`, picked with `STEPS`. A
+`baselines_replicas.sh` job leaves the script it ran as `job.sh` in its output directory.
+`benchmark/summarize.py` turns a job's `.out` files into the tables on the pages.
 `logs/` is not in git.
 
 The `hot_*.out` files in `logs/2026-11-21_exp/` and `_exp2/` are superseded. Those

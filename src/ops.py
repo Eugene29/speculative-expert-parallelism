@@ -5,6 +5,10 @@ process group, and all2all_async does the same without waiting for them to arriv
 gather_sum merges rows on one rank: a weighted sum of gathered rows, in a Triton
 kernel on GPU and in PyTorch ops on CPU.
 
+Both all2alls mark their transfer as communication for spec_ep.phase_clock, with the
+link the caller names: intra for a group within one node, inter when only ranks of
+other nodes exchange rows, both otherwise.
+
 Usage:
     from spec_ep.ops import all2all, all2all_async, gather_sum
 """
@@ -12,6 +16,9 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
+
+from spec_ep.phase_clock import Link, in_flight
 
 try:
     import triton
@@ -28,6 +35,7 @@ def all2all(
     recv: list[int],
     group: dist.ProcessGroup | None = None,
     out: torch.Tensor | None = None,
+    link: Link = "both",
 ) -> torch.Tensor:
     """Variable-size all2all of rows grouped by destination. Collective over group.
 
@@ -37,13 +45,16 @@ def all2all(
         recv: Rows received from each rank of group.
         group: Process group. None means the global group.
         out: Buffer to receive into. Allocated if None.
+        link: The ranks that exchange rows: "intra" for this node's, "inter" for other
+            nodes', "both" for all. Only names the transfer for the event clock.
 
     Returns:
         out: [sum(recv), ...] received rows, grouped by source rank.
     """
     if out is None:
         out = rows.new_empty((sum(recv), *rows.shape[1:]))
-    dist.all_to_all_single(out, rows, recv, send, group=group)
+    with record_function(f"comm/{link}"):
+        dist.all_to_all_single(out, rows, recv, send, group=group)
     return out
 
 
@@ -53,11 +64,13 @@ def all2all_async(
     recv: list[int],
     group: dist.ProcessGroup | None = None,
     out: torch.Tensor | None = None,
+    link: Link = "both",
 ) -> Callable[[], torch.Tensor]:
     """Start an all2all and return before the rows have arrived. Collective over group.
 
     Takes the arguments of all2all. Calls on one group run in the order they were
     started, so work on another group, or on this rank, overlaps with the transfer.
+    Under the event clock the transfer is one comm event from here to its real end.
 
     Returns:
         wait: Blocks until the rows have arrived, then returns out as all2all does.
@@ -65,9 +78,15 @@ def all2all_async(
     if out is None:
         out = rows.new_empty((sum(recv), *rows.shape[1:]))
     work = dist.all_to_all_single(out, rows, recv, send, group=group, async_op=True)
+    in_flight(link, work)
 
     def wait() -> torch.Tensor:
-        work.wait()
+        nonlocal rows
+        with record_function(f"wait/{link}"):
+            work.wait()
+        # NCCL may read rows until here, and torch holds them only until the first
+        # work.wait(), which the clock's in_flight() has already called.
+        rows = None
         return out
 
     return wait

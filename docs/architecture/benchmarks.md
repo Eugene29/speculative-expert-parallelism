@@ -8,6 +8,9 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 | Script | What it measures |
 |---|---|
 | `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD, two-lane and the pipelines, with Tutel, DeepSpeed's MOELayer and DeepEP as baselines. Also the same versions with the hot experts replicated on every node. |
+| `scripts/ds_moe.py` | The whole Qwen model, with any of the same modes as the dispatch of every MoE layer (`--modes`). One model load, a logits check, alternating timed forwards, then each mode's forward as a sum of its steps (`benchmark/phase_clock.py`) and a trace per mode. |
+| `benchmark/phase_clock.py` | The time of every step a mode marks, on the GPU's clock, without a profiler. `python -m benchmark.summarize MODEL.out --by phase` turns the model script's phase lines into a table. |
+| `benchmark/replica_count.py` | The rows that cross between nodes under every replica rule, budget and routing, on recorded routing. CPU only. |
 | `benchmark/hot_experts.py` | How stable the hot experts are from batch to batch, on recorded routing. CPU only. |
 | `benchmark/trace_report.py` | Where the GPU time of a `combine_dispatch --trace` run went, as a table and a timeline picture. CPU only. |
 | `benchmark/all2all/even_vs_uneven.py` | One all2all with the recorded (uneven) split sizes against even ones. |
@@ -19,10 +22,11 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 
 ## How `combine_dispatch` runs
 
-`--modes` picks the versions: `plain`, `plain_fused`, `rbd`, `two_lane`, `plain_pipe`,
-`rbd_pipe`, `tutel`, `ds_moe` and `deepep`. `plain` always runs. The Tutel, DeepSpeed
-and DeepEP adapters are in `benchmark/all2all/baselines.py`, imported only when
-selected.
+`--modes` picks the versions, all built by `benchmark/all2all/modes.py`: `plain`,
+`plain_fused`, `rbd`, `two_lane`, `plain_pipe`, `rbd_pipe`, `autoep`, `tutel`, `ds_moe`,
+`xmoe` and `deepep`. `plain` always runs. The Tutel, DeepSpeed and DeepEP adapters are
+in `benchmark/all2all/baselines.py` and X-MoE's in `benchmark/all2all/xmoe.py`,
+imported only when selected.
 
 A mode takes settings as `name:key=value,key=value`, which become keyword arguments of
 its function. One run can therefore time a mode under several settings, such as
@@ -33,14 +37,18 @@ settings are listed in `baselines.py`.
    chose: one file per recorded rank, `experts_rank{r}.pt`, holding a
    `[num_layers, num_tokens, k]` tensor of expert ids.
 2. **Launch.** `init_dist` starts NCCL from the SLURM environment, and
-   `check_node_layout` checks that ranks fill the nodes in blocks. The RBD modes need
-   two nodes or more, and `deepep` needs every rank on one.
+   `check_node_layout` checks that ranks fill the nodes in blocks. The RBD modes and
+   `xmoe` need two nodes or more. `deepep` needs every rank on one node with the
+   installed build, and runs across nodes with the build of `patches/` first on
+   `PYTHONPATH` (the `deepep` steps of `scripts/jobs/baselines_replicas.sh`).
 3. **Inputs.** `load_routing` gives this rank its share of one layer's recording, and
    `make_inputs` adds random tokens and weights. The routing is the only real data;
-   token values do not affect communication cost. With `--hot N`, `replicate_hot`
-   first reroutes the copies of the N busiest experts to replicas on the token's own
-   node. `--hot-from node` picks the busiest on the tokens the node holds, and
-   `--hot-from DIR` picks them from another recording.
+   token values do not affect communication cost. With `--replicas RULE`, rank 0 first
+   chooses `--budget` replicas per node (`spec_ep.replicas.choose_replicas`), from the
+   timed routing or from another recording (`--choose-from DIR`), and every rank
+   reroutes its copies to them: to replicas on the token's own node only, or with
+   `--cover` to the fewest nodes that hold all of a token's experts. The script
+   prints what that rerouting costs per call; it is not part of any mode's time.
 4. **Count.** `inter_node_rows` counts the rows plain and RBD send between nodes.
 5. **Check.** Every mode runs once with an expert that scales each row by its
    expert id, and its output is compared with plain. A row sent to the wrong expert,

@@ -2,7 +2,7 @@
 
 Usage:
     from benchmark.utils import init_dist, check_node_layout, load_routing, make_inputs, time_ms
-    from benchmark.utils import expert_counts, busiest_remote, replicate_hot
+    from benchmark.utils import expert_counts, load_sample
 """
 import os
 import socket
@@ -118,67 +118,33 @@ def expert_counts(run_dir: str, num_experts: int) -> torch.Tensor:
     return torch.stack(counts)
 
 
-def busiest_remote(
-    counts: torch.Tensor,
-    num_hot: int,
-    rank: int,
-    world: int,
-    gpus_per_node: int,
-) -> torch.Tensor:
-    """Pick the busiest experts that this rank's node does not hold.
+def load_sample(
+    run_dir: str,
+    layer: int,
+    num_nodes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load one layer's routing of every recording, with the node each token starts on.
 
-    A replica of an expert the node already holds would move no copy, so those
-    experts are never picked.
-
-    Args:
-        counts: [num_experts] copies routed to each expert, the same on every rank of
-            a node.
+    The recordings go to the nodes in blocks, in file order, as load_routing() hands
+    them to the ranks. For the run a benchmark replays this is therefore the routing
+    it times, and for any other recording it is a sample from other batches.
 
     Returns:
-        hot: [num_hot] expert ids on other nodes, busiest first.
+        route: [num_tokens, k] expert ids of all recordings, as int64.
+        source_node: [num_tokens] node each token starts on.
     """
-    per_node = counts.numel() // world * gpus_per_node
-    node = rank // gpus_per_node
-    counts = counts.clone()
-    counts[node * per_node : (node + 1) * per_node] = -1
-    return counts.topk(num_hot).indices
-
-
-def replicate_hot(
-    route: torch.Tensor,
-    hot: torch.Tensor,
-    rank: int,
-    world: int,
-    num_experts: int,
-    gpus_per_node: int,
-) -> tuple[torch.Tensor, int]:
-    """Reroute this rank's copies of hot experts to replicas on its own node.
-
-    Every node gets one replica of each hot expert, dealt over its ranks in turn. A
-    replica is a new expert id after its rank's own experts, so every rank still holds
-    one contiguous block of the same size and the dispatch functions run unchanged. A
-    copy whose expert already lives on the token's node keeps its route.
-
-    Args:
-        route: [num_tokens, k] experts each token on this rank is routed to.
-        hot: [num_hot] expert ids to replicate, the same on every rank of a node, as
-            busiest_remote() picks them.
-
-    Returns:
-        route: [num_tokens, k] routes in the grown numbering.
-        num_experts: Experts plus replicas across all ranks.
-    """
-    per_rank = num_experts // world
-    grown = per_rank + -(-hot.numel() // gpus_per_node)
-    node_first = rank // gpus_per_node * gpus_per_node
-
-    index = torch.full((num_experts,), -1, device=route.device)
-    index[hot] = torch.arange(hot.numel(), device=route.device)
-    index = index[route]
-    replica = (node_first + index % gpus_per_node) * grown + per_rank + index // gpus_per_node
-    home = route // per_rank * grown + route % per_rank
-    remote = route // per_rank // gpus_per_node != rank // gpus_per_node
-    return torch.where((index >= 0) & remote, replica, home), world * grown
+    recorded = sum(
+        f.startswith("experts_rank") and f.endswith(".pt") for f in os.listdir(run_dir)
+    )
+    routes = [
+        torch.load(f"{run_dir}/experts_rank{r}.pt", map_location="cpu")[layer].long()
+        for r in range(recorded)
+    ]
+    source_node = torch.cat([
+        torch.full((route.shape[0],), r * num_nodes // recorded)
+        for r, route in enumerate(routes)
+    ])
+    return torch.cat(routes), source_node
 
 
 def make_inputs(
