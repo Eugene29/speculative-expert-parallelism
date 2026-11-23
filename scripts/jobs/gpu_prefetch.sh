@@ -9,7 +9,7 @@
 # Usage:
 #   OUT=logs/2026-11-23_gpu_prefetch/2n salloc -N 2 -q interactive -t 00:40:00 \
 #       -C "gpu&hbm80g" --gpus-per-node=4 -A m5421_g bash -l scripts/jobs/gpu_prefetch.sh
-#   LAYERS= STEPS=model MODES="autoep two_lane rbd_guests:slots=8,source=static" OUT=... \
+#   LAYERS= STEPS=guests GUEST_MODES="two_lane rbd_guests:slots=8,source=static" OUT=... \
 #       salloc -N 4 ... bash -l scripts/jobs/gpu_prefetch.sh
 cd "${REPO:-$(dirname "$(readlink -f "$0")")/../..}"
 REPO=$PWD
@@ -22,7 +22,7 @@ if [ -z "$JOB_COPY" ]; then
   cp "$REPO/scripts/jobs/gpu_prefetch.sh" "$OUT/job.sh"
   REPO=$REPO OUT=$OUT JOB_COPY=1 exec bash -l "$OUT/job.sh"
 fi
-STEPS=${STEPS:-"plan model"}
+STEPS=${STEPS:-"plan model guests"}
 N=$SLURM_JOB_NUM_NODES
 MODEL=${MODEL:-/pscratch/sd/e/eku/spec_ep/models/Qwen3.5-397B-A17B}
 LAYERS=${LAYERS-30}
@@ -67,21 +67,27 @@ if wants plan; then
   done
 fi
 
-# The checkout before the change, on the same nodes.
-if wants old; then
-  OLD_MODES=${OLD_MODES:-"rbd two_lane rbd_guests:slots=$S,source=static"}
-  LOGS=$OUT/old step old 1500 $OLD $all $model --modes $OLD_MODES
+# The modes without guests, and the routing of the batch for benchmark/guest_choice.py.
+if wants model; then
+  MODES=${MODES:-"autoep plain rbd two_lane"}
+  LOGS=$OUT/model step model 1200 $REPO $all $model --record --modes $MODES
 fi
 
-# The modes. Guests: how many fit under a layer, where they come from, the two
-# placements, and the two choices.
-if wants model; then
-  MODES=${MODES:-"autoep plain rbd two_lane \
+# Guests on two-lane RBD: how many fit under a layer, where they come from, the two
+# placements, and the choices. A step of its own, so a failure costs no other mode.
+if wants guests; then
+  GUEST_MODES=${GUEST_MODES:-"two_lane \
       rbd_guests:slots=4,source=static rbd_guests:slots=$S,source=static \
       rbd_guests:slots=16,source=static rbd_guests:slots=$S rbd_guests:slots=$S,source=oracle \
       rbd_guests:slots=$S,source=static,placement=redundant \
       rbd_guests:slots=$S,source=static,choice=pilots \
       rbd_guests:slots=$S,source=static,choice=pilots,balance=2"}
-  LOGS=$OUT/model step model 1800 $REPO $all $model --record --modes $MODES
+  LOGS=$OUT/guests step guests 1500 $REPO $all $model --modes $GUEST_MODES
+fi
+
+# The checkout before the change, on the same nodes.
+if wants old; then
+  OLD_MODES=${OLD_MODES:-"rbd two_lane"}
+  LOGS=$OUT/old step old 900 $OLD $all $model --modes $OLD_MODES
 fi
 echo "##### done $(date +%T)"
