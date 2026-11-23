@@ -7,10 +7,12 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 
 | Script | What it measures |
 |---|---|
-| `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD, two-lane and the pipelines, with Tutel, DeepSpeed's MOELayer and DeepEP as baselines. Also the same versions with the hot experts replicated on every node. |
+| `benchmark/all2all/combine_dispatch.py` | Every dispatch-and-combine version, end to end on recorded routing: plain, RBD and two-lane, with Tutel, DeepSpeed's MOELayer and DeepEP as baselines. Also the same versions with the hot experts replicated on every node. |
 | `scripts/ds_moe.py` | The whole Qwen model, with any of the same modes as the dispatch of every MoE layer (`--modes`). One model load, a logits check, then rounds of one timed and one traced forward per mode. For every mode it prints comm, compute and overlapped time, for the forward and split into inside and outside the MoE layers, a table per step, and a Chrome trace per rank under `LOGS/events/`. |
 | `src/phase_clock.py` | The events behind `ds_moe.py --profile events`: every step a mode marks, as comm or compute on the GPU's clock, with its link and its overlap. A library's own packing inside its transfer call counts as comm, and an all2all that carries same-node and other-node rows is one event with link `both`. |
-| `benchmark/all2all/contention.py` | One all2all and one expert block, alone and overlapped on every rank: how much each slows the other, and what share of the experts a pipeline can hide. |
+| `benchmark/plan_cost.py` | The compute cost of RBD's plan on one GPU, at the shape of a layer of the target model. Every rank is emulated in one process, so no NCCL is involved. |
+| `benchmark/guest_choice.py` | What each way of choosing guests leaves on the network: copies, pilots, how evenly the nodes receive them, and how many guests one rank sends. CPU only. |
+| `benchmark/all2all/contention.py` | One all2all and one expert block, alone and overlapped on every rank: how much each slows the other. |
 | `benchmark/replica_count.py` | The rows that cross between nodes under every replica rule, budget and routing, on recorded routing. CPU only. |
 | `benchmark/hot_experts.py` | How stable the hot experts are from batch to batch, on recorded routing. CPU only. |
 | `benchmark/activation_spread.py` | How widely tokens spread over the experts at different batch sizes, and the pilots that guests leave at each, on recorded routing. |
@@ -27,8 +29,7 @@ Every benchmark is a standalone script launched with `srun`, one process per GPU
 ## How `combine_dispatch` runs
 
 `--modes` picks the versions, all built by `benchmark/all2all/modes.py`: `plain`,
-`plain_fused`, `rbd`, `two_lane`, `plain_pipe`, `rbd_pipe`, `autoep`, `tutel`, `ds_moe`,
-`xmoe` and `deepep`. `plain` always runs. The Tutel, DeepSpeed and DeepEP adapters are
+`plain_fused`, `rbd`, `two_lane`, `autoep`, `tutel`, `ds_moe`, `xmoe` and `deepep`. `plain` always runs. The Tutel, DeepSpeed and DeepEP adapters are
 in `benchmark/all2all/baselines.py` and X-MoE's in `benchmark/all2all/xmoe.py`,
 imported only when selected.
 
@@ -64,8 +65,7 @@ settings are listed in `baselines.py`.
    times every mode in turn in each, so drift over the run favors none. All ranks line
    up at a barrier before each timed call, and each timed call reports its slowest
    rank. The script reports each mode's median, min and max over all rounds.
-   `--expert ffn` times with a real feed-forward expert instead, which is the GPU work
-   the pipelined modes overlap with the network.
+   `--expert ffn` times with a real feed-forward expert instead.
 7. **Trace.** With `--trace DIR`, every mode runs once more under `torch.profiler`
    and every rank writes `DIR/{mode}_rank{r}.json`. `benchmark/trace_report.py DIR`
    turns those into a table of GPU time and a picture.
