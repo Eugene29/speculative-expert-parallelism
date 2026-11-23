@@ -13,12 +13,12 @@ Each function makes three passes over the slices:
 
 Two versions:
     pipelined_rbd_combine_dispatch: RBD's stages on slices planned together
-        (spec_ep.rbd.start_plans): one exchange and one host sync for all of them. The
-        dispatches start as soon as the stage 1 rows are known, and the host-bound rest
-        of the plan (finish_plans) runs while they are on the network. Only the stage 1
-        all2alls are started ahead. A slice's stage 2 over local_group and its experts
-        run under the next slice's stage 1. With lanes=2 every slice's stage 1 goes in
-        the two lanes of spec_ep.two_lane.
+        (spec_ep.rbd.start_plans): one exchange, one host sync and one sort for all of
+        them. The dispatches start as soon as the stage 1 rows are known, and a slice's
+        receiving half of the plan (finish_plan) is queued behind its rows without
+        waiting for them. Only the stage 1 all2alls are started ahead. A slice's stage 2
+        over local_group and its experts run under the next slice's stage 1. With
+        lanes=2 every slice's stage 1 goes in the two lanes of spec_ep.two_lane.
     pipelined_plain_combine_dispatch: one row per (token, expert). Each slice is
         planned on its own, as spec_ep.plain plans a layer, so planning costs `degree`
         times its exchanges and host syncs.
@@ -41,8 +41,15 @@ import torch.distributed as dist
 from torch.profiler import record_function
 
 from spec_ep.ops import all2all, all2all_async, gather_sum
-from spec_ep.rbd import finish_plans, stage2_combine, stage2_dispatch, start_plans, token_slices
-from spec_ep.two_lane import pilots_first, two_lane_all2all_async, two_lane_plan
+from spec_ep.rbd import (
+    finish_plan,
+    stage2_combine,
+    stage2_dispatch,
+    start_plans,
+    token_slices,
+    with_meta,
+)
+from spec_ep.two_lane import two_lane_all2all_async
 
 __all__ = ["pipelined_rbd_combine_dispatch", "pipelined_plain_combine_dispatch"]
 
@@ -78,36 +85,29 @@ def pipelined_rbd_combine_dispatch(
         output: [num_tokens, H] weighted sum of each token's expert outputs, in input
             order.
     """
-    slices = token_slices(tokens.shape[0], degree)
     with record_function("autoep/rbd_plan"):
-        start = start_plans(
-            route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree
+        starts = start_plans(
+            route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree, lanes
         )
-    send1_token, start_all2all = start.send1_token, partial(all2all_async, group=ep_group)
+    start_all2all = partial(all2all_async, group=ep_group)
     if lanes == 2:
-        send1_token = [
-            pilots_first(token, send, gpus_per_node, ep_group)
-            for token, send in zip(send1_token, start.send1)
-        ]
         start_all2all = partial(
             two_lane_all2all_async,
             gpus_per_node=gpus_per_node, local_group=local_group, ep_group=ep_group,
         )
     with record_function("autoep/rbd_stage1_dispatch"):
+        rows = with_meta(tokens, starts[0].meta)
         arriving = [
-            start_all2all(tokens[s][token], send, recv)
-            for s, token, send, recv in zip(slices, send1_token, start.send1, start.recv1)
+            start_all2all(rows[start.send1_token], start.send1, start.recv1) for start in starts
         ]
-    # The rest of the plan is host work, so it runs under the dispatches.
-    with record_function("autoep/rbd_plan"):
-        plans = finish_plans(start)
-        if lanes == 2:
-            plans = [two_lane_plan(plan, gpus_per_node, ep_group) for plan in plans]
 
-    returning = []
-    for plan, wait in zip(plans, arriving):
+    plans, returning = [], []
+    for start, wait in zip(starts, arriving):
         with record_function("autoep/rbd_stage1_dispatch"):
             received = wait()
+        with record_function("autoep/rbd_plan"):
+            received, plan = finish_plan(start, received)
+        plans.append(plan)
         expert_inputs = stage2_dispatch(received, plan, local_group)
         with record_function("autoep/rbd_experts"):
             outputs = expert(expert_inputs, plan.expert_ids)
@@ -116,7 +116,7 @@ def pipelined_rbd_combine_dispatch(
             returning.append(start_all2all(back, plan.recv1, plan.send1))
 
     output = tokens.new_empty(tokens.shape)
-    for s, plan, wait in zip(slices, plans, returning):
+    for s, plan, wait in zip(token_slices(tokens.shape[0], degree), plans, returning):
         with record_function("autoep/rbd_stage1_combine"):
             returned = wait()
         with record_function("autoep/rbd_final_merge"):

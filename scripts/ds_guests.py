@@ -6,24 +6,25 @@ AutoEP layers of scripts/ds_moe.py:
     keep_remote_experts(): while DeepSpeed builds the AutoEP layers, every rank also
         keeps the experts of the other nodes in pinned host memory, the store.
     check_store(): every stored expert against the rank that owns it, once at setup.
-    GuestDispatch: the mode rbd_guests. In MoE layer i every rank
-          1. chooses the guests of layer i + 1 and starts loading them from the store
-             into the pool that layer i is not using, on a side stream;
-          2. runs RBD for layer i on the routing relabeled to the guests chosen during
-             layer i - 1, running a row of a guest with the pool's weights. lanes=2
-             (default) is two-lane RBD, which sends the same-node rows that guests
-             create over the node's own communicator; lanes=1 is RBD in one all2all.
-             degree > 1 is the RBD pipeline on those lanes.
-        So a layer's guests load under the previous layer, and two pools of `slots`
-        experts are all the GPU memory guests take. A predicted choice reaches the
-        host on a side stream and is read after the layer's own host syncs, so
-        choosing adds no sync of its own; its load starts once the layer's experts do.
+    GuestDispatch: the mode rbd_guests. Every layer's weight tensors get `slots` rows
+        after the rank's own experts, its guest rows, so one expert call runs a rank's
+        experts and its guests with no host sync. Guests therefore take layers * slots
+        experts of GPU memory. Every layer runs RBD on its routing relabeled to its
+        guests: lanes=2 (default) is two-lane RBD, which sends the same-node rows that
+        guests create over the node's own communicator; lanes=1 is RBD in one all2all.
+        degree > 1 is the RBD pipeline on those lanes.
 
-Where the guests of layer i + 1 come from (source):
+Where a layer's guests come from (source), and when they are loaded:
     speculative: layer i + 1's router applied to the tokens entering layer i's MoE.
-        The experts it picks are the predicted routing; no recording is needed.
-    static: a recording of another batch, so the same guests for every batch.
+        The experts it picks are the predicted routing; no recording is needed. In
+        MoE layer i every rank chooses the guests of layer i + 1 and starts loading
+        them from the store into that layer's guest rows, on a side stream, so they
+        load under layer i. The choice reaches the host on a side stream and is read
+        after the layer's own host sync, so choosing adds no sync of its own.
+    static: a recording of another batch, so the same guests for every batch. They
+        are loaded once, when the mode is set, and stay.
     oracle: a recording of this batch, the best any prediction could do, at no cost.
+        Loaded once, like static.
 
 GuestDispatch.measure() runs one forward that scores the guests against the oracle's
 on the real routing and times every load; see its docstring for the numbers.
@@ -49,7 +50,6 @@ from functools import partial
 import deepspeed.module_inject.auto_ep_layer as auto_ep_layer
 import torch
 import torch.distributed as dist
-from deepspeed.moe.ep_experts import GroupedExperts
 
 from spec_ep.guests import (
     GuestPool,
@@ -65,6 +65,7 @@ from spec_ep.two_lane import two_lane_rbd_combine_dispatch
 
 SOURCES = ("speculative", "static", "oracle")
 PLACEMENTS = ("unique", "redundant")
+WEIGHTS = ("w1", "w2", "w3")  # an expert's weight tensors in a layer's GroupedExperts
 _LIBC, _MADV_DONTNEED = ctypes.CDLL("libc.so.6"), 4
 Store = list[list[torch.Tensor]]  # per MoE layer: w1, w2, w3 of the other nodes' experts
 
@@ -197,7 +198,7 @@ def _pilots(served: torch.Tensor, num_nodes: int, node: int) -> torch.Tensor:
 
 
 class GuestDispatch:
-    """The mode rbd_guests: RBD on every MoE layer, with guests loaded one layer ahead."""
+    """The mode rbd_guests: RBD on every MoE layer, with guests in the layer's own weights."""
 
     def __init__(
         self,
@@ -255,25 +256,34 @@ class GuestDispatch:
         if source != "speculative":
             guests = [self._choose(layer_routing.to(self.device)) for layer_routing in routing]
             self.recorded = [(g, self._rows(g.slot_expert)) for g in guests]
-        self.pools = self.pool_experts = self.guests = self.predicted = self.stats = None
+        self.pools = self.guests = self.predicted = self.stats = None
 
     def acquire(self) -> None:
-        """Allocate the two pools on the GPU. Call before the mode's first forward."""
-        experts = self.layers[0].experts
-        shapes = [w.shape[1:] for w in (experts.w1, experts.w2, experts.w3)]
-        self.pools = [GuestPool(shapes, self.slots, experts.w1.dtype, self.device) for _ in range(2)]
-        self.pool_experts = []
-        for pool in self.pools:
-            module = GroupedExperts(shapes[0][1], shapes[0][0], self.slots, experts.use_grouped_mm)
-            module.use_triton_grouped_mm = experts.use_triton_grouped_mm
-            module.w1, module.w2, module.w3 = (
-                torch.nn.Parameter(w, requires_grad=False) for w in pool.weights
-            )
-            self.pool_experts.append(module)
+        """Grow every layer's weights by its guest rows and load the recorded guests.
+
+        Call before the mode's first forward. A layer's weight tensors become
+        [L + slots, ...]: the rank's experts, then its guests.
+        """
+        stream = torch.cuda.Stream(self.device)
+        self.pools = []
+        for i, layer in enumerate(self.layers):
+            for name in WEIGHTS:
+                own = getattr(layer.experts, name)
+                grown = own.new_empty((self.L + self.slots, *own.shape[1:]))
+                grown[: self.L] = own
+                setattr(layer.experts, name, torch.nn.Parameter(grown, requires_grad=False))
+            rows = [getattr(layer.experts, name)[self.L :] for name in WEIGHTS]
+            self.pools.append(GuestPool(rows, stream))
+            if self.recorded is not None:
+                self.pools[i].load(self.store[i], self.recorded[i][1])
 
     def release(self) -> None:
-        """Free the pools, so another mode's peak GPU memory does not include them."""
-        self.pools = self.pool_experts = None
+        """Shrink every layer's weights to the rank's own experts, for the next mode."""
+        for layer in self.layers:
+            for name in WEIGHTS:
+                own = getattr(layer.experts, name)[: self.L].clone()
+                setattr(layer.experts, name, torch.nn.Parameter(own, requires_grad=False))
+        self.pools = None
 
     def for_layer(self, i: int) -> Callable[..., torch.Tensor]:
         """The combine_dispatch function of MoE layer i.
@@ -311,20 +321,18 @@ class GuestDispatch:
         expert: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         route: torch.Tensor,
     ) -> torch.Tensor:
-        """Start loading layer i + 1's guests, then run layer i with its own.
+        """Run layer i with its guests, after starting to load layer i + 1's if predicted.
 
         Returns:
             output: [num_tokens, H] the layer's combined output.
         """
-        # Layer i - 1 was the last to read the pool that layer i + 1's guests go into.
         begin = torch.cuda.Event(enable_timing=True)
         begin.record()
         guests, predicted = (self.guests, self.predicted) if i else (self.none, None)
-        last, read = i + 1 == len(self.layers), None
-        if not last and self.recorded is not None:
-            self.guests, rows = self.recorded[i + 1]
-            self.pools[(i + 1) % 2].load(self.store[i + 1], rows, begin)
-        elif not last:
+        read = None
+        if self.recorded is not None:
+            guests = self.recorded[i][0]
+        elif i + 1 < len(self.layers):
             following = self.layers[i + 1]
             self.predicted = following.router.forward(tokens, following.expert_bias)[1]
             self.guests = self._choose(self.predicted)
@@ -335,30 +343,29 @@ class GuestDispatch:
                 self.slot_host.copy_(self.guests.slot_expert, non_blocking=True)
                 read.record()
 
-        run = partial(self._run_experts, self.layers[i], i % 2)
+        run = partial(self._run_experts, self.layers[i], self.pools[i])
         output = self.inner(tokens, weights, run, guests.grown[route], guests.num_experts)
         if read is not None:
             # The layer's own syncs came after the choice, so this returns at once.
             read.synchronize()
-            self.pools[(i + 1) % 2].load(self.store[i + 1], self._rows(self.slot_host), begin)
+            self.pools[i + 1].load(self.store[i + 1], self._rows(self.slot_host), begin)
         if self.stats is not None and i:
             end = torch.cuda.Event(enable_timing=True)
             end.record()
-            self._score(route, guests, predicted, self.pools[i % 2], begin, end)
+            self._score(route, guests, predicted, self.pools[i], begin, end)
         return output
 
     def _run_experts(
         self,
         layer: auto_ep_layer.AutoEPMoELayer,
-        pool: int,
+        pool: GuestPool,
         rows: torch.Tensor,
         grown_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Run rows through this rank's experts and its guests, by their grown ids.
 
-        The grouped kernel wants rows sorted by expert, and the rank's own experts and
-        the guests live in two weight tensors, so the sorted rows are cut where the
-        guests begin. Reading that cut is the one host sync guests add to a layer.
+        The layer's weights hold both, the guests after the rank's own, so this is the
+        layer's expert call over L + slots experts, once the guests have loaded.
 
         Returns:
             outputs: [num_inputs, H] expert outputs, in the order of rows.
@@ -367,16 +374,9 @@ class GuestDispatch:
         order = local.argsort(stable=True)
         counts = torch.zeros(self.L + self.slots, dtype=torch.int32, device=rows.device)
         counts.scatter_add_(0, local, torch.ones_like(local, dtype=torch.int32))
-        num_home = int(counts[: self.L].sum())
-        rows = rows[order]
-        sorted_outputs = rows.new_empty(rows.shape)
-        if num_home:
-            sorted_outputs[:num_home] = layer.experts(rows[:num_home], counts[: self.L])
-        if num_home < rows.shape[0]:
-            self.pools[pool].wait()
-            sorted_outputs[num_home:] = self.pool_experts[pool](rows[num_home:], counts[self.L :])
+        pool.wait()
         outputs = rows.new_empty(rows.shape)
-        outputs[order] = sorted_outputs
+        outputs[order] = layer.experts(rows[order], counts)
         return outputs
 
     def _score(
@@ -413,8 +413,8 @@ class GuestDispatch:
     def measure(self, forward: Callable[[], object], print0: Callable[[str], None], name: str) -> None:
         """Run one forward and print how good its guests were and what loading them took.
 
-        Collective. Layer 0 has no guests and is left out. Printed, over all ranks and
-        the layers 1 and up:
+        Collective. Layer 0 is left out: it has no predicted guests. Printed, over all
+        ranks and the layers 1 and up:
             pilots: inter-node rows RBD sends per direction, with these guests, with
                 none, and with the oracle's guests on the same routing.
             covered: share of the copies for other nodes that a guest serves.
@@ -424,10 +424,11 @@ class GuestDispatch:
             load: milliseconds the copies of one layer's guests took, how long that
                 MoE layer itself then took, in how many layers the load was the
                 shorter of the two, and how long before their first use the guests
-                were ready (a negative time means the stream waited for them). The
-                copies run before the layer that uses them, under the previous layer
-                and the attention between the two, so the layer's time is a yardstick
-                for one MoE layer and not the span the load ran in.
+                were ready (a negative time means the stream waited for them). A
+                predicted layer's copies run under the previous layer and the
+                attention between the two, so the layer's time is a yardstick for one
+                MoE layer and not the span the load ran in. Recorded guests were
+                loaded when the mode was set.
 
         Args:
             forward: Runs one forward of the model on this rank.

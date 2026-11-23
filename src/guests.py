@@ -22,8 +22,9 @@ Three steps, each one function or class here:
                but two ranks of a node may load the same expert.
     3. GuestPool: slots experts' weights on the GPU, refilled from pinned host memory
        on a side stream, so a load runs under whatever the main stream does meanwhile.
-       Two pools that take turns hold the guests of the running layer and of the next
-       one, which bounds the extra GPU memory at 2 * slots experts whatever the depth.
+       The pool fills tensors its caller owns. scripts/ds_guests.py gives it the rows
+       after a layer's own experts in that layer's weight tensors, so one expert call
+       runs a rank's experts and its guests, at layers * slots experts of GPU memory.
 
 Guests reuse the numbering of spec_ep.replicas: every rank's block of expert ids grows
 from L to L + slots, a guest being a new id after the rank's own experts. Experts stay
@@ -282,9 +283,9 @@ def home_ids(
 class GuestPool:
     """The weights of `slots` experts on the GPU, refilled from pinned host memory.
 
-    load() returns at once: the copies run on the pool's own stream, under whatever
-    the main stream does, and start only after the work that still reads the pool's
-    old contents. wait() makes the current stream wait for the last load, which costs
+    load() returns at once: the copies run on the pool's stream, under whatever the
+    main stream does, and start only after the work that still reads the pool's old
+    contents. wait() makes the current stream wait for the last load, which costs
     nothing when the load is already over.
 
     After a load, `started`, `loaded` and `needed` are CUDA events that time it:
@@ -295,19 +296,18 @@ class GuestPool:
 
     def __init__(
         self,
-        shapes: list[torch.Size],
-        slots: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        weights: list[torch.Tensor],
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
-        """Allocate the pool.
+        """Take the tensors to fill.
 
         Args:
-            shapes: Shape of one expert's part of each weight tensor.
-            slots: Experts the pool holds.
+            weights: One [slots, ...] tensor per weight tensor of an expert. Views of
+                larger tensors work, such as the rows after a layer's own experts.
+            stream: Stream the copies run on; pools may share one. A new one if None.
         """
-        self.weights = [torch.empty((slots, *shape), dtype=dtype, device=device) for shape in shapes]
-        self.stream = torch.cuda.Stream(device)
+        self.weights = weights
+        self.stream = stream or torch.cuda.Stream(weights[0].device)
         self.started = self.loaded = self.needed = None
 
     def load(

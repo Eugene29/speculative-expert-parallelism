@@ -131,7 +131,7 @@ def test_pool_loads_rows_and_keeps_weights_in_use() -> None:
     """A load fills the slots it is given, and waits for work queued on the old weights."""
     device = torch.device("cuda")
     sources = [torch.randn(6, 4, 3).pin_memory(), torch.randn(6, 5).pin_memory()]
-    pool = GuestPool([torch.Size((4, 3)), torch.Size((5,))], 3, torch.float32, device)
+    pool = GuestPool([torch.empty(3, 4, 3, device=device), torch.empty(3, 5, device=device)])
 
     pool.load(sources, [4, -1, 0])
     pool.wait()

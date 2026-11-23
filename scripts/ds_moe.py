@@ -178,8 +178,8 @@ def init_deepspeed(
 def set_mode(engine: deepspeed.DeepSpeedEngine, mode: Mode | GuestDispatch | None) -> None:
     """Make every AutoEP layer dispatch and combine through mode; None is its own path.
 
-    A GuestDispatch gives every layer its own function and holds two pools of guest
-    weights on the GPU, which it gets here and gives back when another mode is set.
+    A GuestDispatch gives every layer its own function and grows the layers' weights
+    by its guest rows, which it does here and undoes when another mode is set.
     """
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
     previous = getattr(getattr(layers[0].combine_dispatch, "func", None), "__self__", None)

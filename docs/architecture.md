@@ -46,10 +46,10 @@ Imports point one way: each layer imports only from the layers above it in this 
 |---|---|---|
 | `src/ops.py` | Operations shared by the algorithms. | `all2all`, `all2all_async`, `gather_sum` |
 | `src/plain.py` | The plain reference. | `plain_combine_dispatch` |
-| `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `make_plan`, `make_plans`, `token_slices`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
+| `src/rbd.py` | RBD: planning and the five stages. | `Plan`, `PlanStart`, `start_plans`, `finish_plan`, `with_meta`, `token_slices`, `stage1_dispatch`, `stage2_dispatch`, `stage2_combine`, `stage1_combine`, `final_merge`, `rbd_combine_dispatch`, `PILOT_RULES` |
 | `src/replicas.py` | Replicas of experts on other nodes: choosing them, routing to them, and rewriting a routing so the dispatch functions use them. | `RULES`, `choose_replicas`, `serving_node`, `replica_ids`, `relabel`, `inter_node_rows` |
 | `benchmark/utils.py` | Launch, recorded routing, inputs, timing. | `init_dist`, `check_node_layout`, `load_routing`, `load_sample`, `expert_counts`, `make_inputs`, `time_ms` |
-| `src/two_lane.py` | RBD with stage 1 in two lanes. | `two_lane_plan`, `two_lane_dispatch`, `two_lane_combine`, `two_lane_rbd_combine_dispatch` |
+| `src/two_lane.py` | RBD with stage 1 in two lanes. | `two_lane_all2all_async`, `two_lane_dispatch`, `two_lane_combine`, `two_lane_rbd_combine_dispatch` |
 | `src/pipeline.py` | RBD and plain on slices of the tokens. | `pipelined_rbd_combine_dispatch`, `pipelined_plain_combine_dispatch` |
 | `src/guests.py` | Guest experts: choosing a rank's guests from routing demand, numbering them for RBD, and the GPU pool that loads their weights from host memory. | `Guests`, `remote_demand`, `choose_guests`, `no_guests`, `home_ids`, `GuestPool` |
 | `benchmark/all2all/modes.py` | Every dispatch-and-combine version behind one call, `mode(tokens, weights, expert, route)`. The layer benchmark and the model script both build their modes here. | `MODES`, `parse_mode`, `build_mode` |
@@ -85,6 +85,6 @@ Imports point one way: each layer imports only from the layers above it in this 
 
 1. `src/plain.py`: the whole round trip in its simplest form.
 2. `src/rbd.py`: `rbd_combine_dispatch` and the five stages, treating `Plan` as given.
-3. `src/rbd.py`: `make_plan`, one numbered step at a time.
+3. `src/rbd.py`: `start_plans` and `finish_plan`, one commented step at a time.
 4. `src/two_lane.py`, then `src/pipeline.py`.
 5. `benchmark/all2all/combine_dispatch.py`.
