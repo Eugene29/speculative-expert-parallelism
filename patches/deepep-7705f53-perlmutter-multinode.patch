@@ -1,0 +1,404 @@
+diff --git a/csrc/deep_ep.cpp b/csrc/deep_ep.cpp
+index dd8c58c..796fe9c 100644
+--- a/csrc/deep_ep.cpp
++++ b/csrc/deep_ep.cpp
+@@ -1344,4 +1344,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
+ 
+     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
++
++    // Build settings the Python side needs: ranks per node, and whether the internode kernels
++    // use NVSHMEM's portable device API instead of IBGDA.
++    m.attr("NUM_MAX_NVL_PEERS") = NUM_MAX_NVL_PEERS;
++#ifdef EP_GENERIC_NVSHMEM
++    m.attr("GENERIC_NVSHMEM") = true;
++#else
++    m.attr("GENERIC_NVSHMEM") = false;
++#endif
+ }
+diff --git a/csrc/deep_ep.hpp b/csrc/deep_ep.hpp
+index 00f8d0c..6b03501 100644
+--- a/csrc/deep_ep.hpp
++++ b/csrc/deep_ep.hpp
+@@ -23,7 +23,6 @@
+ namespace deep_ep {
+ 
+ struct Buffer {
+-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
+ 
+ private:
+     // Low-latency mode buffer
+diff --git a/csrc/kernels/configs.cuh b/csrc/kernels/configs.cuh
+index a7b960b..9bbc456 100644
+--- a/csrc/kernels/configs.cuh
++++ b/csrc/kernels/configs.cuh
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
++// Ranks per node. Upstream assumes 8-GPU nodes; build with -DNUM_MAX_NVL_PEERS=2 or 4 for smaller nodes.
++#ifndef NUM_MAX_NVL_PEERS
+ #define NUM_MAX_NVL_PEERS 8
++#endif
+ #define NUM_MAX_RDMA_PEERS 20
+ #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
+ #define NUM_MAX_LOCAL_EXPERTS 1024
+@@ -47,7 +50,8 @@
+ #include <cuda_bf16.h>
+ #include <cuda_runtime.h>
+ 
+-#ifndef DISABLE_SM90_FEATURES
++// NVSHMEM's headers pull in the real FP8 types, so the stand-ins below would clash with them
++#if !defined(DISABLE_SM90_FEATURES) || defined(EP_GENERIC_NVSHMEM)
+ #include <cuda_fp8.h>
+ #else
+ // Ampere does not support FP8 features
+@@ -61,7 +65,20 @@ typedef uint8_t __nv_fp8_storage_t;
+ #ifndef DISABLE_NVSHMEM
+ #include <nvshmem.h>
+ #include <nvshmemx.h>
++#ifndef EP_GENERIC_NVSHMEM
+ #include <infiniband/mlx5dv.h>
+ #include <non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh>
+ #include <device_host_transport/nvshmem_common_ibgda.h>
+ #endif
++#endif
++
++// One integer that covers a node's NUM_MAX_NVL_PEERS bools in `is_token_in_rank`.
++#if NUM_MAX_NVL_PEERS == 8
++typedef uint64_t nvl_bools_t;
++#elif NUM_MAX_NVL_PEERS == 4
++typedef uint32_t nvl_bools_t;
++#elif NUM_MAX_NVL_PEERS == 2
++typedef uint16_t nvl_bools_t;
++#else
++#error "NUM_MAX_NVL_PEERS must be 2, 4 or 8"
++#endif
+diff --git a/csrc/kernels/generic_device.cuh b/csrc/kernels/generic_device.cuh
+new file mode 100644
+index 0000000..2a44189
+--- /dev/null
++++ b/csrc/kernels/generic_device.cuh
+@@ -0,0 +1,41 @@
++// Stand-ins for the helpers of `ibgda_device.cuh`, written with NVSHMEM's portable device API,
++// so the internode kernels run over any NVSHMEM remote transport (libfabric on Slingshot here).
++// NVSHMEM's host proxy thread sends each put. IBGDA keeps a counter add behind the payload that
++// precedes it on the same queue pair; here the fence after every put does that.
++#pragma once
++
++#include "configs.cuh"
++#include "exception.cuh"
++#include "utils.cuh"
++
++namespace deep_ep {
++
++// Called by a whole warp. `qp_id` and `message_idx` only matter to IBGDA.
++template <bool kAlwaysDoPostSend = false>
++__device__ static __forceinline__ void
++nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {
++    nvshmemx_int8_put_nbi_warp(reinterpret_cast<int8_t*>(req_rptr), reinterpret_cast<const int8_t*>(req_lptr), bytes, dst_pe);
++    if (lane_id == 0)
++        nvshmem_fence();
++    __syncwarp();
++}
++
++// Called by one thread. The counters are 64-bit, as with IBGDA.
++__device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void* rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
++    if (is_local_copy) {
++        atomicAdd(static_cast<unsigned long long*>(rptr), value);
++    } else {
++        nvshmemx_signal_op(static_cast<uint64_t*>(rptr), static_cast<uint64_t>(static_cast<int64_t>(value)), NVSHMEM_SIGNAL_ADD, pe);
++    }
++}
++
++// No peer is reachable by load/store here, so every other rank reports "use RDMA".
++__device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank) {
++    return rank == dst_rank ? ptr : 0;
++}
++
++__device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
++    nvshmem_quiet();
++}
++
++} // namespace deep_ep
+diff --git a/csrc/kernels/internode.cu b/csrc/kernels/internode.cu
+index cf3f974..ced47c9 100644
+--- a/csrc/kernels/internode.cu
++++ b/csrc/kernels/internode.cu
+@@ -3,7 +3,11 @@
+ #include "exception.cuh"
+ #include "launch.cuh"
+ #include "utils.cuh"
++#ifdef EP_GENERIC_NVSHMEM
++#include "generic_device.cuh"
++#else
+ #include "ibgda_device.cuh"
++#endif
+ 
+ namespace deep_ep {
+ 
+@@ -14,7 +18,7 @@ extern nvshmem_team_t cpu_rdma_team;
+ struct SourceMeta {
+     int src_rdma_rank, is_token_in_nvl_rank_bits;
+ 
+-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
++    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 8, "Invalid number of maximum NVL peers");
+ 
+     __forceinline__ SourceMeta() = default;
+ 
+@@ -240,8 +244,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
+             // Iterate over tokens
+             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
+             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
+-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+-                auto is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
++                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(nvl_bools_t), "Invalid number of NVL peers");
++                auto is_token_in_rank_uint64 = *reinterpret_cast<const nvl_bools_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
+                 auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
+                 #pragma unroll
+                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++ j)
+@@ -364,7 +368,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
+     const bool is_forwarder = sm_id % 2 == 0;
+     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+ 
++#ifndef EP_GENERIC_NVSHMEM
+     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
++#endif
+ 
+     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
+         if (is_forwarder) {
+@@ -389,7 +395,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
+     EP_DEVICE_ASSERT(num_topk <= 32);
+ 
+     // RDMA symmetric layout
+-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
++    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(nvl_bools_t), "Invalid number of NVL peers");
+     auto hidden_bytes = hidden_int4 * sizeof(int4);
+     auto num_bytes_per_rdma_token = get_num_bytes_per_rdma_token(hidden_int4, num_scales, num_topk, num_topk);
+     auto rdma_channel_data = SymBuffer<int8_t>(rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token, kNumRDMARanks, channel_id, num_channels);
+@@ -467,9 +473,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
+         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
+         for (token_idx = token_start_idx; token_idx < token_end_idx; ++ token_idx) {
+             // Read RDMA rank existence
+-            uint64_t is_token_in_rank_uint64 = 0;
++            uint64_t is_token_in_rank_uint64 = 0;  // the node's bools, zero-extended
+             if (lane_id < kNumRDMARanks) {
+-                is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
++                is_token_in_rank_uint64 = __ldg(reinterpret_cast<const nvl_bools_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
+             }
+             __syncwarp();
+diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
+index 6054e98..542e912 100644
+--- a/csrc/kernels/internode_ll.cu
++++ b/csrc/kernels/internode_ll.cu
+@@ -1,7 +1,11 @@
+ #include "configs.cuh"
+ #include "exception.cuh"
+ #include "launch.cuh"
++#ifdef EP_GENERIC_NVSHMEM
++#include "generic_device.cuh"
++#else
+ #include "ibgda_device.cuh"
++#endif
+ 
+ namespace deep_ep {
+ 
+@@ -176,7 +180,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+         EP_DEVICE_ASSERT(num_sms > 1);
+         if (sm_id == 0) {
+             // The first SM is also responsible for checking QPs
++#ifndef EP_GENERIC_NVSHMEM
+             EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
++#endif
+ 
+             // The first SM is also responsible for cleaning the next buffer
+             #pragma unroll
+diff --git a/csrc/kernels/runtime.cu b/csrc/kernels/runtime.cu
+index 26fecd5..aae6151 100644
+--- a/csrc/kernels/runtime.cu
++++ b/csrc/kernels/runtime.cu
+@@ -7,8 +7,12 @@
+ #include "utils.cuh"
+ 
+ #ifndef DISABLE_NVSHMEM
++#ifdef EP_GENERIC_NVSHMEM
++#include "generic_device.cuh"
++#else
+ #include "ibgda_device.cuh"
+ #endif
++#endif
+ 
+ namespace deep_ep {
+ 
+diff --git a/csrc/kernels/utils.cuh b/csrc/kernels/utils.cuh
+index 3d37268..7063db5 100644
+--- a/csrc/kernels/utils.cuh
++++ b/csrc/kernels/utils.cuh
+@@ -471,15 +471,25 @@ barrier_block(int** barrier_signal_ptrs, int rank) {
+     __syncthreads();
+ }
+ 
++// NOTES: `addr` is a generic pointer into shared memory. With the `.shared::cta` state space, sm_80 code takes
++// it as a shared-window offset and faults ("Warp Out of range Address"), so Ampere builds use generic addressing.
+ __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
+     int ret;
++#ifndef DISABLE_SM90_FEATURES
+     asm volatile("atom.acquire.cta.shared::cta.cas.b32 %0, [%1], %2, %3;" : "=r"(ret) : "l"(addr), "r"(x), "r"(y) : "memory");
++#else
++    asm volatile("atom.acquire.cta.cas.b32 %0, [%1], %2, %3;" : "=r"(ret) : "l"(addr), "r"(x), "r"(y) : "memory");
++#endif
+     return ret;
+ }
+ 
+ __forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
+     int ret;
++#ifndef DISABLE_SM90_FEATURES
+     asm volatile("atom.release.cta.shared::cta.exch.b32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(x) : "memory");
++#else
++    asm volatile("atom.release.cta.exch.b32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(x) : "memory");
++#endif
+     return ret;
+ }
+ 
+diff --git a/deep_ep/buffer.py b/deep_ep/buffer.py
+index 389d631..5185a87 100644
+--- a/deep_ep/buffer.py
++++ b/deep_ep/buffer.py
+@@ -50,7 +50,8 @@ class Buffer:
+                 please make sure all connections are via NVLink.
+             allow_mnnvl: whether to allow MNNVL
+         """
+-        check_nvlink_connections(group)
++        if not int(os.environ.get('DEEPEP_SKIP_NVLINK_CHECK', 0)):
++            check_nvlink_connections(group)
+ 
+         # Initialize the CPP runtime
+         self.rank = group.rank()
+@@ -74,14 +75,25 @@ class Buffer:
+         # Synchronize NVSHMEM unique IDs
+         root_unique_id = None
+         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+-            # Enable IBGDA 
+-            assert num_qps_per_rank > 0
+-            os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
+-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+-            os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
+-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+-            # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+-            os.environ['NVSHMEM_QP_DEPTH'] = '1024'
++            if deep_ep_cpp.GENERIC_NVSHMEM:
++                # Portable NVSHMEM build: any remote transport, libfabric over Slingshot (cxi) by default.
++                # Every put goes through the transport, so the same-GPU shortcut stays off.
++                assert not low_latency_mode, 'The portable NVSHMEM build only supports the normal kernels'
++                os.environ.setdefault('NVSHMEM_REMOTE_TRANSPORT', 'libfabric')
++                os.environ.setdefault('NVSHMEM_LIBFABRIC_PROVIDER', 'cxi')
++                os.environ.setdefault('NVSHMEM_DISABLE_P2P', '1')
++                # A fixed heap that the transport registers once: the buffer plus NVSHMEM's own needs
++                os.environ.setdefault('NVSHMEM_DISABLE_CUDA_VMM', '1')
++                os.environ.setdefault('NVSHMEM_SYMMETRIC_SIZE', f'{num_rdma_bytes + 2 ** 28}')
++            else:
++                # Enable IBGDA
++                assert num_qps_per_rank > 0
++                os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
++                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
++                os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
++                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
++                # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
++                os.environ['NVSHMEM_QP_DEPTH'] = '1024'
+ 
+             # Reduce gpu memory usage
+             # 6 default teams + 1 extra team
+@@ -186,6 +198,23 @@ class Buffer:
+             bias_0, bias_1 = bias
+         return bias_0, bias_1
+ 
++    @staticmethod
++    def _config_key(num_ranks: int) -> int:
++        """
++        Map a group size to its entry in the config tables, which assume 8 ranks per node.
++        A build with fewer ranks per node takes the entry with as many nodes: the RDMA chunk sizes depend on
++        the number of nodes, and combine hangs if a chunk has fewer tokens than a forwarder has warps
++        (16 / number of nodes).
++
++        Argument:
++            num_ranks: the number of ranks.
++
++        Returns:
++            key: the group size to look up.
++        """
++        num_nvl_peers = deep_ep_cpp.NUM_MAX_NVL_PEERS
++        return num_ranks if num_ranks <= num_nvl_peers else num_ranks // num_nvl_peers * 8
++
+     @staticmethod
+     def get_dispatch_config(num_ranks: int) -> Config:
+         """
+@@ -198,6 +227,8 @@ class Buffer:
+             config: the recommended config.
+         """
+ 
++        num_ranks = Buffer._config_key(num_ranks)
++
+         # TODO: automatically tune
+         config_map = {
+             2: Config(Buffer.num_sms, 24, 256, 6, 128),
+@@ -226,6 +257,8 @@ class Buffer:
+             config: the recommended config.
+         """
+ 
++        num_ranks = Buffer._config_key(num_ranks)
++
+         # TODO: automatically tune
+         config_map = {
+             2: Config(Buffer.num_sms, 10, 256, 6, 128),
+diff --git a/setup.py b/setup.py
+index da09c8b..1948aa5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -28,9 +28,31 @@ if __name__ == '__main__':
+     else:
+         sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+         include_dirs.extend([f'{nvshmem_dir}/include'])
++        # NVSHMEM 3.3 and later include libcu++ headers, which the host compiler does not find by itself
++        cccl_dir = os.path.join(os.getenv('CUDA_HOME', '/usr/local/cuda'), 'include', 'cccl')
++        if os.path.exists(cccl_dir):
++            include_dirs.append(cccl_dir)
+         library_dirs.extend([f'{nvshmem_dir}/lib'])
+-        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem'])
+-        extra_link_args.extend(['-l:libnvshmem.a', '-l:nvshmem_bootstrap_uid.so', f'-Wl,-rpath,{nvshmem_dir}/lib'])
++        if os.path.exists(f'{nvshmem_dir}/lib/libnvshmem_host.so'):
++            # NVSHMEM 3.3 and later split the library into a host and a device part
++            nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
++            extra_link_args.extend(['-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
++        else:
++            nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem'])
++            extra_link_args.extend(['-l:libnvshmem.a', '-l:nvshmem_bootstrap_uid.so', f'-Wl,-rpath,{nvshmem_dir}/lib'])
++
++    # Internode kernels over NVSHMEM's portable device API instead of IBGDA (any remote transport)
++    generic_nvshmem = bool(int(os.getenv('EP_GENERIC_NVSHMEM', 0)))
++    if generic_nvshmem:
++        assert not disable_nvshmem, '`EP_GENERIC_NVSHMEM` needs `NVSHMEM_DIR`'
++        cxx_flags.append('-DEP_GENERIC_NVSHMEM')
++        nvcc_flags.append('-DEP_GENERIC_NVSHMEM')
++
++    # Ranks per node, 8 by default
++    num_max_nvl_peers = os.getenv('NUM_MAX_NVL_PEERS', None)
++    if num_max_nvl_peers is not None:
++        cxx_flags.append(f'-DNUM_MAX_NVL_PEERS={int(num_max_nvl_peers)}')
++        nvcc_flags.append(f'-DNUM_MAX_NVL_PEERS={int(num_max_nvl_peers)}')
+ 
+     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
+         # Prefer A100
+@@ -40,8 +62,11 @@ if __name__ == '__main__':
+         cxx_flags.append('-DDISABLE_SM90_FEATURES')
+         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
+ 
+-        # Disable internode and low-latency kernels
+-        assert disable_nvshmem
++        # The IBGDA internode and low-latency kernels need SM90; the portable ones do not
++        assert disable_nvshmem or generic_nvshmem
++        if not disable_nvshmem:
++            # Linking NVSHMEM's device library needs relocatable device code
++            nvcc_flags.append('-rdc=true')
+     else:
+         # Prefer H800 series
+         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')

@@ -62,7 +62,8 @@ def plain_combine_dispatch(
 
         send = copy_rank.bincount(minlength=world)
         recv = torch.empty_like(send)
-        dist.all_to_all_single(recv, send, group=ep_group)
+        with record_function("comm/both"):
+            dist.all_to_all_single(recv, send, group=ep_group)
         send, recv = send.tolist(), recv.tolist()
         expert_ids = all2all(copy_expert, send, recv, ep_group)
 

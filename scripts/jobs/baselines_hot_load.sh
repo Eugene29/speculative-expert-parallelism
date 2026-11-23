@@ -133,17 +133,18 @@ fi
 
 # The busiest experts replicated on every node: chosen ahead from the new recording
 # (static) against chosen from the node's own tokens (the best a dynamic loader can do).
+# The 2026-11-21 runs used --hot N --hot-from DIR|node, since replaced by these flags.
 if wants hot; then
   HOT=$REC; [ -f "$REC/experts_rank0.pt" ] || HOT=$RUN
   hot_modes="--repeats 5 --iterations 2 --modes plain plain_fused rbd two_lane"
   step hot_layer0_0 120 $two $bench 0 $hot_modes --trace "$OUT/traces_hot0"
   for n in 16 32 64; do
-    step hot_layer0_${n}_static 120 $two $bench 0 $hot_modes --hot $n --hot-from "$HOT"
-    step hot_layer0_${n}_node 120 $two $bench 0 $hot_modes --hot $n --hot-from node \
+    step hot_layer0_${n}_static 120 $two $bench 0 $hot_modes --replicas copies --budget $n --choose-from "$HOT"
+    step hot_layer0_${n}_node 120 $two $bench 0 $hot_modes --replicas copies --budget $n \
         --trace "$OUT/traces_hot${n}"
   done
   step hot_layer20_0 120 $two $bench 20 $hot_modes
-  step hot_layer20_32_static 120 $two $bench 20 $hot_modes --hot 32 --hot-from "$HOT"
-  step hot_layer20_32_node 120 $two $bench 20 $hot_modes --hot 32 --hot-from node
+  step hot_layer20_32_static 120 $two $bench 20 $hot_modes --replicas copies --budget 32 --choose-from "$HOT"
+  step hot_layer20_32_node 120 $two $bench 20 $hot_modes --replicas copies --budget 32
 fi
 echo "##### DONE $(date +%T)"

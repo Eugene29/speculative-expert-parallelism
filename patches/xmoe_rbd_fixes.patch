@@ -1,0 +1,53 @@
+diff --git a/deepspeed/moe/v2opt/metadata.py b/deepspeed/moe/v2opt/metadata.py
+index 09fbf880..1e05a415 100644
+--- a/deepspeed/moe/v2opt/metadata.py
++++ b/deepspeed/moe/v2opt/metadata.py
+@@ -194,7 +194,7 @@ def rbd_metadata(indices, bin_ids, num_experts, top_k, mesh_size, num_local_expe
+ 
+     # s2 dispatching: s1exp_to_s2_indices, s2_bin_ids, 
+     return (indices_s1, indices_s2, bin_ids_s1, bins_s1, ins_s1, outs_s1, ins_s2_virtual, outs_s2_virtual, \
+-             s1exp_to_s2_indices, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp)
++             s1exp_to_s2_indices, bin_ids_s2_indices, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp)
+ 
+ def rbd_metadata_opt(indices, bin_ids, num_experts, top_k, mesh_size, num_local_experts, ep_group, local_group, permutation=None, verification=False):
+ 
+diff --git a/deepspeed/moe/v2opt/rbd.py b/deepspeed/moe/v2opt/rbd.py
+index eb192c8f..43312249 100644
+--- a/deepspeed/moe/v2opt/rbd.py
++++ b/deepspeed/moe/v2opt/rbd.py
+@@ -43,7 +43,7 @@ class RBDispatcher(torch.nn.Module):
+     def forward(self, x: torch.Tensor, n_tokens: int, metadata, time_breakdown=False):
+ 
+         indices_s1, indices_s2, bin_ids_s1, bins_s1, ins_s1, outs_s1, ins_s2_virtual, outs_s2_virtual, \
+-                s1exp_to_s2_indices, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp = metadata
++                s1exp_to_s2_indices, s2_order, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp = metadata
+ 
+         st_gather = self._start_timer(time_breakdown)
+         dx_s1 = gather_with_token_drop(x, indices_s1, bin_ids_s1, bins_s1, n_tokens, self.top_k)
+@@ -73,7 +73,7 @@ class RBDispatcher(torch.nn.Module):
+         t_a2a_l = self._stop_timer(st_a2a_l)
+ 
+         st_local_order = self._start_timer(time_breakdown)
+-        dx_exp_ = torch.cat([dx_s2_exp, dx_s1_exp])
++        dx_exp_ = torch.cat([dx_s1_exp, dx_s2_exp])
+         t_local_order = self._stop_timer(st_local_order)
+ 
+         if time_breakdown:
+@@ -117,7 +117,7 @@ class RBCombiner(torch.nn.Module):
+     def forward(self, dout_exp: torch.Tensor, weights: torch.Tensor, n_tokens: int, metadata, time_breakdown=False):
+ 
+         indices_s1, indices_s2, bin_ids_s1, bins_s1, ins_s1, outs_s1, ins_s2_virtual, outs_s2_virtual, \
+-                s1exp_to_s2_indices, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp = metadata
++                s1exp_to_s2_indices, s2_order, bin_ids_s2, bins_s2, ins_s2, outs_s2, tokens_per_expert_s1_exp, tokens_per_experts_s2_exp = metadata
+ 
+         # dout_s2_exp = LocalOrderRecoverOp.apply(dout_exp, indices_s2, bin_ids_s2, bins_s2, n_tokens, self.top_k) 
+ 
+@@ -128,7 +128,7 @@ class RBCombiner(torch.nn.Module):
+         weights_s1 = weights[indices_s1]
+         weights_s2_virtual = weights[indices_s2]
+         weights_s1_exp = _AllToAllSingle.apply(self.ep_group, weights_s1, ins_s1, outs_s1)
+-        weights_s2 = _AllToAllSingle.apply(self.ep_group, weights_s2_virtual, ins_s2_virtual, outs_s2_virtual)
++        weights_s2 = _AllToAllSingle.apply(self.ep_group, weights_s2_virtual, ins_s2_virtual, outs_s2_virtual)[s2_order]
+         timing['weight_calc'] = self._stop_timer(st_weight_calc)
+ 
+         st_reorder = self._start_timer(time_breakdown)

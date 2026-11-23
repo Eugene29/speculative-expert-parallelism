@@ -6,7 +6,9 @@ only from a script started by srun or the DeepSpeed launcher.
 Usage:
     from ds_utils import rank, print0, count_params, add_expert_statistics_hook
 """
+import gc
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -87,6 +89,25 @@ def add_expert_statistics_hook(
     return handles
 
 
+def watch_full_collections() -> list[float]:
+    """Record how long every full garbage collection takes from now on.
+
+    Returns:
+        seconds: A list that grows by one duration per full collection.
+    """
+    seconds, started = [], [0.0]
+
+    def on_collection(phase: str, info: dict[str, int]) -> None:
+        """Time the collections of the oldest generation, which walk every object."""
+        if info["generation"] == 2 and phase == "start":
+            started[0] = time.time()
+        elif info["generation"] == 2:
+            seconds.append(time.time() - started[0])
+
+    gc.callbacks.append(on_collection)
+    return seconds
+
+
 def report_peak_mem(dev: torch.device) -> None:
     """Print every rank's peak GPU memory, in rank order. Collective."""
     peak_alloc = torch.cuda.max_memory_allocated(dev) / 2**30
@@ -138,17 +159,14 @@ def torch_profile_ctx() -> profile:
     )
 
 
-def save_torch_profile(prof: profile, outdir: Path, verbose: bool = False) -> None:
-    """Write this rank's trace to outdir/profile/trace_rank{r}.json.
+def save_torch_profile(prof: profile, outdir: Path, name: str) -> None:
+    """Write this rank's trace to outdir/{name}_rank{r}.json.
 
-    With verbose, rank 0 also writes the 30 ops with the most CUDA time to
-    outdir/profile/key_averages.txt.
+    Rank 0 also writes the 30 ops with the most CUDA time to
+    outdir/{name}_key_averages.txt.
     """
-    trace = outdir / "profile" / f"trace_rank{rank}.json"
-    prof.export_chrome_trace(str(trace))
-
-    events = prof.key_averages()
-
-    if verbose and (rank == 0):
-        table = events.table(sort_by="cuda_time_total", row_limit=30)
-        (outdir / "profile" / "key_averages.txt").write_text(table)
+    outdir.mkdir(parents=True, exist_ok=True)
+    prof.export_chrome_trace(str(outdir / f"{name}_rank{rank}.json"))
+    if rank == 0:
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=30)
+        (outdir / f"{name}_key_averages.txt").write_text(table)

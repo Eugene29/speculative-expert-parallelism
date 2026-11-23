@@ -92,9 +92,11 @@ def _two_lane_all2all(
 
     out = rows.new_empty((sum(recv), rows.shape[1]))
     wait = all2all_async(
-        rows[num_sent:], send[lo:hi], recv[lo:hi], local_group, out=out[num_recv:]
+        rows[num_sent:], send[lo:hi], recv[lo:hi], local_group, out=out[num_recv:], link="intra"
     )
-    all2all(rows[:num_sent], network_send, network_recv, ep_group, out=out[:num_recv])
+    all2all(
+        rows[:num_sent], network_send, network_recv, ep_group, out=out[:num_recv], link="inter"
+    )
     wait()
     return out
 

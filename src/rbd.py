@@ -138,7 +138,8 @@ def _even_pilot_offsets(
     node_counts = torch.zeros(num_nodes, dtype=torch.long, device=expert_node.device)
     node_counts.scatter_add_(0, expert_node.flatten(), is_pilot.long().flatten())
     all_counts = node_counts.new_empty(world * num_nodes)
-    dist.all_gather_into_tensor(all_counts, node_counts, group=ep_group)
+    with record_function("comm/both"):
+        dist.all_gather_into_tensor(all_counts, node_counts, group=ep_group)
     return all_counts.view(world, num_nodes)[:rank].sum(dim=0)
 
 
@@ -162,7 +163,8 @@ def _exchange_counts(
     counts.scatter_add_(0, slots, torch.ones_like(slots))
     counts = counts[:unused].view(world, C)
     recv_counts = torch.empty_like(counts)
-    dist.all_to_all_single(recv_counts, counts, group=ep_group)
+    with record_function("comm/both"):
+        dist.all_to_all_single(recv_counts, counts, group=ep_group)
     return counts, recv_counts
 
 
@@ -193,7 +195,7 @@ def _send_pilot_meta(
         ],
         dim=1,
     )
-    meta = all2all(meta, pilot_send, pilot_recv, ep_group)
+    meta = all2all(meta, pilot_send, pilot_recv, ep_group, link="inter")
     return meta[:, :k], meta[:, k:].view(torch.float32)
 
 
@@ -368,6 +370,7 @@ def stage2_dispatch(
             plan.recv2,
             local_group,
             out=expert_inputs[num_direct:],
+            link="intra",
         )
         expert_inputs[:num_direct].copy_(received[start:end])
     return expert_inputs
@@ -388,7 +391,9 @@ def stage2_combine(
         start, end = plan.direct
         num_direct = end - start
         outputs = outputs.contiguous()
-        returned = all2all(outputs[num_direct:], plan.recv2, plan.send2, local_group)
+        returned = all2all(
+            outputs[num_direct:], plan.recv2, plan.send2, local_group, link="intra"
+        )
         back = outputs.new_empty((sum(plan.recv1), outputs.shape[1]))
         back[start:end].copy_(outputs[:num_direct])
         gather_sum(
