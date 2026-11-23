@@ -85,4 +85,12 @@ if wants guests; then
       rbd_guests:slots=16,source=static,placement=redundant rbd_guests:slots=16,lanes=1 autoep"}
   LOGS=$OUT/guests step guests 900 $all $model --repeats 5 --profile events --modes $GUEST_MODES
 fi
+# More slot counts between the ones of the guests step, to find the largest whose load
+# still ends before its MoE layer does.
+if wants slots; then
+  SLOT_MODES=${SLOT_MODES:-"rbd two_lane rbd_guests:slots=16 rbd_guests:slots=20 \
+      rbd_guests:slots=24 rbd_guests:slots=28 rbd_guests:slots=32 \
+      rbd_guests:slots=24,source=static rbd_guests:slots=24,placement=redundant"}
+  LOGS=$OUT/slots step slots 900 $all $model --repeats 5 --profile --modes $SLOT_MODES
+fi
 echo "##### done $(date +%T)"

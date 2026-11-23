@@ -27,7 +27,9 @@ In a blocking round trip the GPU idles while rows are on the network. The pipeli
 cuts a rank's tokens into `degree` slices and gives each slice its own round trip, so
 the experts of one slice run while the next slice is on the network.
 
-1. Plan every slice, then start every slice's dispatch without waiting.
+1. Plan every slice as far as its stage 1 rows (`start_plans`), start every slice's
+   dispatch without waiting, then build the rest of the plans (`finish_plans`) while
+   the rows are on the network.
 2. Per slice: wait for its rows, run the experts, and start its combine without
    waiting.
 3. Per slice: wait for its returned rows and merge them.
@@ -35,10 +37,13 @@ the experts of one slice run while the next slice is on the network.
 `pipelined_rbd_combine_dispatch` uses RBD's stages and `pipelined_plain_combine_dispatch`
 the plain all2all. `expert` is called once per slice.
 
-The RBD pipeline plans all slices in one exchange: `make_plans` gives the counts one
+The RBD pipeline plans all slices in one exchange: `start_plans` gives the counts one
 block of columns per slice and reads every slice's split sizes in a single host sync,
-so a forward pays one plan whatever the degree, and one small all2all carries the
-pilot metadata of every slice. The plain pipeline still plans per slice.
+and one small all2all carries the pilot metadata of every slice. `finish_plans` is
+the rest of the plan, about 30 small operations per slice that are host-bound and
+need no other rank; it runs under the dispatches, so even at degree 1 the pipeline is
+ahead of `rbd_combine_dispatch`, which finishes its plan first. The plain pipeline
+still plans per slice.
 
 What a slice can hide is its stage 2 and its experts, under the stage 1 rows of the
 other slices. Two things bound it. With `degree` slices, the first dispatch and the
@@ -68,6 +73,8 @@ guests of the experts a node asks other nodes for most remove pilots.
 
 In the model (`scripts/ds_guests.py`, mode `rbd_guests`), MoE layer i chooses and
 starts loading the guests of layer i + 1, then runs with the guests chosen during
-layer i - 1. The next layer's guests come from its router applied to this layer's
+layer i - 1. It runs on two-lane RBD by default: a guest turns a pilot into same-node
+rows, which the all2all over all ranks carries slowly and the node's own communicator
+does not. The next layer's guests come from its router applied to this layer's
 tokens (speculative), from a recording of another batch (static), or of this batch
 (oracle).
