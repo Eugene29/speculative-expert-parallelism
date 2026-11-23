@@ -17,9 +17,12 @@ Each experiment is written up as one Notion page under
 | [Profiles 02](https://app.notion.com/p/420e2e64355e81e09a34f2483ac1758e): each component's latency in the Qwen model, timed with CUDA events | `benchmark/phase_clock.py`, `scripts/ds_moe.py --profile phases`, `benchmark/summarize.py --by phase` | `model`, `model_deepep` | `logs/2026-11-22_trace/2n/`, the stall probe in `logs/2026-11-22_trace/probe/` |
 | [Redundancy 01](https://app.notion.com/p/420e2e64355e81c0a5f8eb597ad11b4e): cover routing, raising token redundancy across all nodes | `src/replicas.py` (`cover`, `ring`, `serving_node(cover=True)`), `benchmark/replica_count.py` | `replicas`, `channels` on 4 nodes | `logs/2026-11-22_exp/replica_count_4nodes.out`, `4n/replicas_*.out` |
 | [DeepEP 01](https://app.notion.com/p/420e2e64355e813c9eb9fa41bae40e34): DeepEP across nodes on Perlmutter | `patches/`, `benchmark/all2all/baselines.py` (`deepep`) | `deepep`, `model_deepep` | `/pscratch/sd/e/eku/deepep_multinode/logs/job_61768851/` |
+| Pipeline 01: why pipelining gained nothing for Tutel and RBD, and the fix | `src/rbd.py` (`start_plans`, `finish_plans`), `src/pipeline.py`, `benchmark/all2all/contention.py`, `benchmark/pipeline_report.py`, `scripts/ds_moe.py --profile events` | `contention`, `pipe`, `model` of `pipeline_prefetch.sh` | `logs/2026-11-22_pipeline/2n/`, `2n_b/` |
+| Guests 01: hot experts of other nodes loaded from host memory, chosen by prediction | `src/guests.py`, `scripts/ds_guests.py`, `scripts/ds_moe.py --modes rbd_guests:...` | `guests` of `pipeline_prefetch.sh` | `logs/2026-11-22_pipeline/2n_guests/`, `2n_b/` |
 
 The job steps of the first three pages are those of `scripts/jobs/baselines_hot_load.sh`, and
-the later ones those of `scripts/jobs/baselines_replicas.sh`, picked with `STEPS`. A
+the later ones those of `scripts/jobs/baselines_replicas.sh`, picked with `STEPS`; the
+Pipeline and Guests pages use `scripts/jobs/pipeline_prefetch.sh`. A
 `baselines_replicas.sh` job leaves the script it ran as `job.sh` in its output directory.
 `benchmark/summarize.py` turns a job's `.out` files into the tables on the pages.
 `logs/` is not in git.

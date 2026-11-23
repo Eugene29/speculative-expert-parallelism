@@ -46,6 +46,14 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 
 ## Performance
 
+- [ ] Start RBD's own dispatch before the host-bound rest of its plan. The pipeline
+  does (`start_plans`, then the dispatches, then `finish_plans`); `rbd_combine_dispatch`
+  and two-lane still finish the plan first.
+- [ ] Guests without the host sync in the expert call. `GuestDispatch._run_experts`
+  reads how many rows are for the rank's own experts, to cut the sorted rows where
+  the guests begin.
+- [ ] Guests' weights in one buffer per expert. A load is three copies per guest, one
+  per weight tensor, each a call on the host.
 - [ ] A cheaper `make_plan`. It is about a quarter of an RBD round trip, mostly
   host time.
 - [ ] The pipeline over two-lane.
@@ -108,8 +116,6 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 Each comes back as one file that imports only public names: the plan and stage
 functions of `rbd.py`, and `ops.py`.
 
-- [ ] Expert offload: experts in host memory instead of on other ranks. Measured as a
-  load time only (`benchmark/internode/expert_load.py`); keep them in pinned memory.
 - [ ] Hot-expert swaps. Replicas are back (`src/replicas.py`); swaps are not.
 - [ ] Low priority: Expert placement searches.
 - [ ] Low priority: Preemptive partition: bisect the experts by co-activation.
