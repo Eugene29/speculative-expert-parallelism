@@ -46,20 +46,21 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 
 ## Performance
 
-- [ ] Start RBD's own dispatch before the host-bound rest of its plan. The pipeline
-  does (`start_plans`, then the dispatches, then `finish_plans`); `rbd_combine_dispatch`
-  and two-lane still finish the plan first.
-- [ ] Guests without the host sync in the expert call. `GuestDispatch._run_experts`
-  reads how many rows are for the rank's own experts, to cut the sorted rows where
-  the guests begin.
-- [ ] Guests' weights in one buffer per expert. A load is three copies per guest, one
-  per weight tensor, each a call on the host.
-- [ ] A cheaper `make_plan`. This is the largest item left: 72 ms of a 516 ms two-lane
-  forward of the 35B model, 1.8 ms per layer of host time whatever the batch, where
-  DeepEP's plan takes 2.2 ms per forward (Guests 02). It is why RBD loses to plain
-  at 1024 tokens per rank and below (Guests 02).
-- [ ] A plain fallback for small batches, chosen by `benchmark/rbd_benefit.py`'s saved
-  rows: under about 35,000 saved rows per layer the plan costs more than RBD saves.
+- [ ] The plan as one layout kernel. It is 0.9 ms per layer now, about 105 torch
+  operations of which 40 are views, where DeepEP's is 0.06 ms (Plan 01). The source
+  half's classification and count slots, about 30 operations, would be one launch.
+- [ ] The pipeline's cost per slice. A second slice adds about 2.3 ms per layer at 512
+  to 1024 tokens per rank: its half of the plan, an expert call, and four more
+  all2alls. Nothing at that size is long enough to hide them (Plan 01).
+- [ ] A degree the pipeline picks itself. With 1024 tokens per rank one slice beats
+  AutoEP and two lose to it (Plan 01); every rank must pick the same degree.
+- [ ] RBD at 512 tokens per rank and below. AutoEP and plain take 0.17 to 0.18 s and
+  RBD 0.205 s: every all2all and every operation costs its fixed latency there, and
+  RBD makes more of both (Plan 01).
+- [ ] Guests' weights in one buffer per expert. A speculative load is three copies per
+  guest, one per weight tensor, each a call on the host.
+- [ ] Guest rows for the layers that need them only. Guests take `layers * slots`
+  experts of GPU memory since Plan 01, which Qwen3.5-122B cannot hold on 40 GB.
 - [ ] The event totals of the guest modes. Their comm and compute inside the MoE
   layers add up to more than the forward, because a guest load shows as a long
   in-flight transfer; only their per-step rows are usable (Guests 02).
@@ -129,6 +130,13 @@ functions of `rbd.py`, and `ops.py`.
 ## Done
 
 Finished items move here with the date and where the result is written up.
+
+- [x] 2026-11-23. A cheaper plan, after DeepEP's: a cached layout, metadata in the
+  stage 1 rows, one sort for all slices in lane order. 93 to 35 ms per forward in
+  two-lane at 4096 tokens per rank, and two-lane 0.539 to 0.483 s in one job (Plan 01).
+- [x] 2026-11-23. Guests in the layer's own weight tensors: one expert call, no host
+  sync, recorded guests loaded once. With the plan, static guests beat AutoEP at 1024
+  tokens per rank, 0.221 against 0.230 to 0.247 s, and not at 512 (Plan 01).
 
 - [x] 2026-11-22. The pipeline over two-lane (`pipelined_rbd_combine_dispatch(lanes=2)`),
   with and without guests. It is slower than two-lane without slices on the 35B model

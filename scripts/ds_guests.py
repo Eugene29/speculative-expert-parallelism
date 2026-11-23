@@ -268,10 +268,12 @@ class GuestDispatch:
         self.pools = []
         for i, layer in enumerate(self.layers):
             for name in WEIGHTS:
+                # Swap the data, not the Parameter: whoever holds it sees the grown
+                # tensor, and the old one is freed.
                 own = getattr(layer.experts, name)
                 grown = own.new_empty((self.L + self.slots, *own.shape[1:]))
                 grown[: self.L] = own
-                setattr(layer.experts, name, torch.nn.Parameter(grown, requires_grad=False))
+                own.data = grown
             rows = [getattr(layer.experts, name)[self.L :] for name in WEIGHTS]
             self.pools.append(GuestPool(rows, stream))
             if self.recorded is not None:
@@ -281,8 +283,8 @@ class GuestDispatch:
         """Shrink every layer's weights to the rank's own experts, for the next mode."""
         for layer in self.layers:
             for name in WEIGHTS:
-                own = getattr(layer.experts, name)[: self.L].clone()
-                setattr(layer.experts, name, torch.nn.Parameter(own, requires_grad=False))
+                own = getattr(layer.experts, name)
+                own.data = own.data[: self.L].clone()
         self.pools = None
 
     def for_layer(self, i: int) -> Callable[..., torch.Tensor]:
