@@ -99,7 +99,7 @@ from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 from benchmark.all2all.modes import MODES, Mode, build_mode, parse_mode
 from spec_ep.phase_clock import Event, PhaseClock, Totals, totals, write_trace
 
-from ds_guests import GuestDispatch, keep_remote_experts
+from ds_guests import GuestDispatch, check_store, keep_remote_experts
 from ds_utils import (
     add_expert_statistics_hook,
     count_params,
@@ -497,6 +497,10 @@ def main() -> None:
 
     layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
     layer = layers[0]
+    if guest_settings:
+        check_store(layers, store, args.gpus_per_node)
+        print0(f"guest store: {len(store)} layers x {store[0][0].shape[0]} experts of other nodes "
+               f"per rank, each checked against its owner")
     local_group, _ = torch.distributed.new_subgroups(group_size=args.gpus_per_node)
     width = max(map(len, args.modes))
 

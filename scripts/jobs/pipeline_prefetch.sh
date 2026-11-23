@@ -93,4 +93,12 @@ if wants slots; then
       rbd_guests:slots=24,source=static rbd_guests:slots=24,placement=redundant"}
   LOGS=$OUT/slots step slots 900 $all $model --repeats 5 --profile --modes $SLOT_MODES
 fi
+# One table of the main modes from one process, with the guest store checked against
+# the ranks that own its experts.
+if wants final; then
+  FINAL_MODES=${FINAL_MODES:-"autoep rbd two_lane rbd_pipe:degree=2 rbd_guests:slots=24 \
+      rbd_guests:slots=24,source=static rbd_guests:slots=24,source=oracle \
+      rbd_guests:slots=24,placement=redundant"}
+  LOGS=$OUT/final step final 600 $all $model --repeats 5 --profile --modes $FINAL_MODES
+fi
 echo "##### done $(date +%T)"

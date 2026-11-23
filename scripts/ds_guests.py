@@ -5,6 +5,7 @@ AutoEP layers of scripts/ds_moe.py:
 
     keep_remote_experts(): while DeepSpeed builds the AutoEP layers, every rank also
         keeps the experts of the other nodes in pinned host memory, the store.
+    check_store(): every stored expert against the rank that owns it, once at setup.
     GuestDispatch: the mode rbd_guests. In MoE layer i every rank
           1. chooses the guests of layer i + 1 and starts loading them from the store
              into the pool that layer i is not using, on a side stream;
@@ -33,6 +34,7 @@ Usage:
     #   rbd_guests:slots=16,source=static,placement=redundant,lanes=1,degree=2
     with keep_remote_experts(gpus_per_node) as store:
         engine = init_deepspeed(model, config)
+    check_store(layers, store, gpus_per_node)
     mode = GuestDispatch(layers, store, gpus_per_node, local_group, slots=16)
     mode.acquire()
     layers[i].combine_dispatch = mode.for_layer(i)
@@ -84,6 +86,35 @@ def keep_remote_experts(gpus_per_node: int) -> Iterator[Store]:
         yield store
     finally:
         auto_ep_layer.repack_expert_weights = repack
+
+
+@torch.no_grad()
+def check_store(
+    layers: list[auto_ep_layer.AutoEPMoELayer],
+    store: Store,
+    gpus_per_node: int,
+) -> None:
+    """Fail unless every stored expert is the one its owner holds. Collective over the EP group.
+
+    Every rank takes the sum of squares of each of its own experts' first weight tensor
+    in every layer, the ranks exchange them, and each compares them with those of its
+    store's rows. A store row that holds another expert, or another layer's, does not
+    match: two experts' sums of squares differ far more than rounding does.
+    """
+    group = layers[0].ep_group
+    world, rank = dist.get_world_size(group), dist.get_rank(group)
+    energy = lambda w: w.float().square().sum(dim=(1, 2), dtype=torch.float64)
+    own = torch.stack([energy(layer.experts.w1) for layer in layers])
+    owners = own.new_empty((world * own.shape[0], own.shape[1]))
+    dist.all_gather_into_tensor(owners, own, group=group)
+    truth = owners.view(world, *own.shape).permute(1, 0, 2).flatten(1).cpu()  # [num_layers, E]
+    per_node = truth.shape[1] // (world // gpus_per_node)
+    remote = torch.ones(truth.shape[1], dtype=torch.bool)
+    remote[rank // gpus_per_node * per_node :][:per_node] = False
+    kept = torch.stack([energy(weights[0]) for weights in store])
+    wrong = ((kept - truth[:, remote]).abs() > 1e-5 * kept).sum().item()
+    if wrong:
+        raise RuntimeError(f"rank {rank}: {wrong} stored experts differ from their owner's weights.")
 
 
 def _pilots(served: torch.Tensor, num_nodes: int, node: int) -> torch.Tensor:
