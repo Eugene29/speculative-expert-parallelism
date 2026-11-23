@@ -134,15 +134,30 @@ if wants profile; then
       rbd_guests:slots=$S rbd_guests:slots=$S,degree=2 rbd_guests:slots=$S,lanes=1 \
       rbd_guests:slots=$S,lanes=1,degree=2 rbd_guests:slots=$S,source=static \
       rbd_guests:slots=$S,source=static,degree=2 rbd_guests:slots=$S,source=oracle \
-      rbd_guests:slots=$S,choice=pilots rbd_guests:slots=$S,source=oracle,choice=pilots,rounds=96"}
+      rbd_guests:slots=$S,choice=pilots rbd_guests:slots=$S,source=oracle,choice=pilots,rounds=$S"}
   LOGS=$OUT/profile_ours step profile_ours 600 $all $model --record $events --modes $OURS
-  DEEPEP=/pscratch/sd/e/eku/deepep_multinode/build
-  deepep_env="env PYTHONPATH=$(ls -d $DEEPEP/deepep-nvl4/lib.*):$PYTHONPATH \
-      LD_PRELOAD=$DEEPEP/nvshmem-3.4.5-install/lib/libnvshmem_host.so.3 \
-      NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=hsn DEEPEP_SKIP_NVLINK_CHECK=1"
-  OTHERS=${OTHERS:-"autoep rbd two_lane tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
-      deepep:fused=True,num_sms=48,rdma_chunk=128"}
+fi
+DEEPEP=/pscratch/sd/e/eku/deepep_multinode/build
+deepep_env="env PYTHONPATH=$(ls -d $DEEPEP/deepep-nvl4/lib.*):$PYTHONPATH \
+    LD_PRELOAD=$DEEPEP/nvshmem-3.4.5-install/lib/libnvshmem_host.so.3 \
+    NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=hsn DEEPEP_SKIP_NVLINK_CHECK=1"
+OTHERS=${OTHERS:-"autoep rbd two_lane tutel:capacity_factor=1 tutel:capacity_factor=1,degree=2 \
+    deepep:fused=True,num_sms=48,rdma_chunk=128"}
+if wants others; then
   LOGS=$OUT/profile_others step profile_others 480 $deepep_env $all -c 32 $model $events \
+      --modes $OTHERS
+fi
+# A bigger model (BIG, on 80 GB GPUs): the same two profiles. Its experts are three
+# times the size, so a layer has time to load fewer guests: B slots, and half of them.
+if wants big; then
+  BIG=${BIG:-/pscratch/sd/e/eku/spec_ep/models/Qwen3.5-122B-A10B}
+  B=${BIG_SLOTS:-16}
+  BIG_OURS=${BIG_OURS:-"autoep plain rbd two_lane rbd_pipe:degree=2 rbd_pipe:degree=2,lanes=2 \
+      rbd_guests:slots=$((B / 2)) rbd_guests:slots=$B rbd_guests:slots=$((B / 2)),degree=2 \
+      rbd_guests:slots=$B,degree=2 rbd_guests:slots=$B,source=static \
+      rbd_guests:slots=$B,choice=pilots"}
+  LOGS=$OUT/big_ours step big_ours 1200 $all $model --model $BIG $events --modes $BIG_OURS
+  LOGS=$OUT/big_others step big_others 1000 $deepep_env $all -c 32 $model --model $BIG $events \
       --modes $OTHERS
 fi
 echo "##### done $(date +%T)"

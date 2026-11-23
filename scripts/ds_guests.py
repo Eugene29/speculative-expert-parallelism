@@ -88,11 +88,15 @@ def keep_remote_experts(gpus_per_node: int, stripe: int = 1) -> Iterator[Store]:
     store: Store = []
 
     def repack_and_keep(experts_source, spec, ep_rank: int, ep_size: int) -> tuple[torch.Tensor, ...]:
-        node, num_nodes = ep_rank // gpus_per_node, ep_size // gpus_per_node
-        others = [repack(experts_source, spec, n, num_nodes) for n in range(num_nodes) if n != node]
-        store.append([
-            torch.cat(parts)[ep_rank % stripe :: stripe].pin_memory() for parts in zip(*others)
-        ])
+        # One expert per call, so a rank reads only the experts it keeps: reading a
+        # whole node's experts of a 122B model put 136 GiB in every rank's memory.
+        E = spec.num_experts
+        per_node = E // (ep_size // gpus_per_node)
+        kept = [
+            repack(experts_source, spec, e, E) for e in range(E)
+            if e // per_node != ep_rank // gpus_per_node and e % stripe == ep_rank % stripe
+        ]
+        store.append([torch.cat(parts).pin_memory() for parts in zip(*kept)])
         return repack(experts_source, spec, ep_rank, ep_size)
 
     auto_ep_layer.repack_expert_weights = repack_and_keep
