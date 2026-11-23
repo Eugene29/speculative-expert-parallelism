@@ -68,17 +68,21 @@ Expert = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 Mode = Callable[[torch.Tensor, torch.Tensor, Expert, torch.Tensor], torch.Tensor]
 
 
-def parse_mode(spec: str) -> tuple[str, dict[str, object]]:
+def parse_mode(spec: str, known: tuple[str, ...] = MODES) -> tuple[str, dict[str, object]]:
     """Split a mode given as name:key=value,key=value.
 
+    Args:
+        spec: The mode.
+        known: Names to accept. A script with modes of its own passes them too.
+
     Returns:
-        name: One of MODES.
+        name: One of known.
         settings: Keyword arguments for the mode's function. Values are Python
             literals where they parse as one (2, 0.5, True) and strings otherwise.
     """
     name, _, rest = spec.partition(":")
-    if name not in MODES:
-        raise ValueError(f"Unknown mode {name!r} in {spec!r}. Modes: {', '.join(MODES)}.")
+    if name not in known:
+        raise ValueError(f"Unknown mode {name!r} in {spec!r}. Modes: {', '.join(known)}.")
     settings = {}
     for item in filter(None, rest.split(",")):
         key, _, value = item.partition("=")

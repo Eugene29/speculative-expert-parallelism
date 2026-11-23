@@ -6,10 +6,16 @@ data/short_text.txt. The model is loaded once. --modes then picks how every MoE 
 dispatches and combines: autoep is the layer's own path, and any other mode of
 benchmark/all2all/modes.py (rbd, two_lane, tutel:capacity_factor=1, ds_moe, xmoe, ...)
 replaces it with that mode's function, the same one the layer benchmark times.
+rbd_guests is built here (scripts/ds_guests.py): RBD in which every rank also runs the
+hottest experts of other nodes, loaded from host memory one layer ahead. Its settings
+are slots (guests per rank), source (speculative, static or oracle), placement (unique
+or redundant) and degree (slices of the RBD pipeline), as in
+rbd_guests:slots=16,source=static. After its first forward it prints how its guests
+compare with the oracle's and what loading them took (GuestDispatch.measure).
 
 For every mode the script first runs one untimed forward and prints how far its last
 logits are from the first mode's, and on how many of the last tokens both pick the
-same top token. A mode that drops copies, such as tutel at its default capacity,
+same top token, and the peak GPU memory of that forward. A mode that drops copies, such as tutel at its default capacity,
 differs for that reason. Modes that keep every copy still differ in bf16, because
 their merge kernels round differently and 40 layers grow the difference; --dtype
 float32 shows whether they compute the same function. It then times --repeats rounds, one
@@ -90,9 +96,10 @@ from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 from torch.profiler import record_function
 from transformers import AutoTokenizer, Qwen3_5MoeForCausalLM
 
-from benchmark.all2all.modes import Mode, build_mode
+from benchmark.all2all.modes import MODES, Mode, build_mode, parse_mode
 from spec_ep.phase_clock import Event, PhaseClock, Totals, totals, write_trace
 
+from ds_guests import GuestDispatch, check_store, keep_remote_experts
 from ds_utils import (
     add_expert_statistics_hook,
     count_params,
@@ -110,6 +117,7 @@ from ds_utils import (
 
 logs = Path(os.environ["LOGS"])
 LAYER = "moe/layer"  # the span around MoE layer i is called moe/layer{i}
+GUESTS = "rbd_guests"  # the one mode built here, not by benchmark/all2all/modes.py
 Row = tuple[str, str, str, str]  # scope, step, category and link of one row of the events table
 
 
@@ -163,28 +171,40 @@ def init_deepspeed(
     return engine
 
 
-def set_mode(engine: deepspeed.DeepSpeedEngine, mode: Mode | None) -> None:
-    """Make every AutoEP layer dispatch and combine through mode; None is its own path."""
-    for layer in engine.module.modules():
-        if isinstance(layer, AutoEPMoELayer):
-            layer.combine_dispatch = mode
+def set_mode(engine: deepspeed.DeepSpeedEngine, mode: Mode | GuestDispatch | None) -> None:
+    """Make every AutoEP layer dispatch and combine through mode; None is its own path.
+
+    A GuestDispatch gives every layer its own function and holds two pools of guest
+    weights on the GPU, which it gets here and gives back when another mode is set.
+    """
+    layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
+    previous = getattr(getattr(layers[0].combine_dispatch, "func", None), "__self__", None)
+    if isinstance(previous, GuestDispatch):
+        previous.release()
+    if isinstance(mode, GuestDispatch):
+        mode.acquire()
+    for i, layer in enumerate(layers):
+        layer.combine_dispatch = mode.for_layer(i) if isinstance(mode, GuestDispatch) else mode
 
 
 def get_batch(
     model_id: str,
     dev: torch.device,
     seq_len: int,
+    text_path: str = "data/short_text.txt",
+    skip: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Cut this rank's seq_len tokens from data/short_text.txt.
+    """Cut this rank's seq_len tokens from a text file, after its first skip tokens.
 
-    Rank r gets tokens r * seq_len to (r + 1) * seq_len, so no two ranks share any.
+    Rank r gets tokens skip + r * seq_len to skip + (r + 1) * seq_len, so no two ranks
+    share any.
 
     Returns:
         batch: input_ids and attention_mask, each [1, seq_len].
     """
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    text = Path("data/short_text.txt").read_text(encoding="utf-8")
+    text = Path(text_path).read_text(encoding="utf-8")
     text = " ".join(text.split())
 
     tokens = tokenizer(
@@ -193,7 +213,7 @@ def get_batch(
         return_tensors="pt",
     )
 
-    strt, end = rank*seq_len, (rank+1)*seq_len
+    strt, end = skip + rank*seq_len, skip + (rank+1)*seq_len
 
     if tokens.input_ids[:, strt:end].shape[1] < seq_len:
         raise ValueError(f"Provide more text: at least {seq_len} tokens are required. "
@@ -210,18 +230,20 @@ def get_batch(
 def record_expert_routing(
     engine: deepspeed.DeepSpeedEngine,
     batch: dict[str, torch.Tensor],
-) -> None:
-    """Run one forward and save the experts every token on this rank chose.
+) -> torch.Tensor:
+    """Run one forward and return the experts every token on this rank chose.
 
-    Writes LOGS/experts_rank{r}.pt: one [num_layers, num_tokens, k] int16 tensor of
-    expert ids. The hooks come off afterwards, so later forwards are timed without them.
+    The hooks come off afterwards, so later forwards are timed without them.
+
+    Returns:
+        routing: [num_layers, num_tokens, k] int16 expert ids, on CPU.
     """
     sent = {}
     handles = add_expert_statistics_hook(engine.module, sent)
     engine(**batch, use_cache=False)
     for handle in handles:
         handle.remove()
-    torch.save(torch.stack(list(sent.values())), logs / f"experts_rank{rank}.pt")
+    return torch.stack(list(sent.values()))
 
 
 def timed_forward(
@@ -438,6 +460,10 @@ def parse_args() -> argparse.Namespace:
                         help="autoep for the layer's own path, or modes of benchmark/all2all/modes.py")
     parser.add_argument("--gpus-per-node", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=3, help="Timed rounds over the modes")
+    parser.add_argument("--history-text", default="data/long_text.txt",
+                        help="Text of the batch that rbd_guests:source=static takes its guests from")
+    parser.add_argument("--history-skip", type=int, default=600_000,
+                        help="Tokens of --history-text to skip: it starts with the timed text")
     parser.add_argument("--record", action="store_true",
                         help="Save the expert routing to LOGS/experts_rank{r}.pt before timing")
     parser.add_argument("--profile", nargs="*", choices=["events", "torch", "flops", "comm"],
@@ -457,29 +483,64 @@ def main() -> None:
     model_id, seq_len = args.model, args.seq_len
     full_collections = watch_full_collections()
 
+    known = (*MODES, GUESTS)
+    guest_settings = {
+        spec: parse_mode(spec, known)[1] for spec in args.modes if parse_mode(spec, known)[0] == GUESTS
+    }
+    sources = {settings.get("source", "speculative") for settings in guest_settings.values()}
+
     model = load_model(model_id, getattr(torch, args.dtype))
-    engine = init_deepspeed(model, args.config_pth)
+    # Guests load from host memory, so the experts of other nodes are kept there.
+    with keep_remote_experts(args.gpus_per_node) if guest_settings else contextlib.nullcontext() as store:
+        engine = init_deepspeed(model, args.config_pth)
     batch = get_batch(model_id, engine.device, seq_len)
 
-    layer = next(m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer))
+    layers = [m for m in engine.module.modules() if isinstance(m, AutoEPMoELayer)]
+    layer = layers[0]
+    if guest_settings:
+        check_store(layers, store, args.gpus_per_node)
+        print0(f"guest store: {len(store)} layers x {store[0][0].shape[0]} experts of other nodes "
+               f"per rank, each checked against its owner")
     local_group, _ = torch.distributed.new_subgroups(group_size=args.gpus_per_node)
-    modes = {
-        spec: None if spec == "autoep" else build_mode(
-            spec, layer.num_experts, args.gpus_per_node, local_group, layer.ep_group
-        )
-        for spec in args.modes
-    }
-    width = max(map(len, modes))
+    width = max(map(len, args.modes))
 
     with torch.inference_mode():
+        # Recorded routing: this batch's for --record and the oracle guests, another
+        # batch's for the static guests.
+        routing = {}
+        if args.record or "oracle" in sources:
+            routing["oracle"] = record_expert_routing(engine, batch)
         if args.record:
-            record_expert_routing(engine, batch)
+            torch.save(routing["oracle"], logs / f"experts_rank{rank}.pt")
+        if "static" in sources:
+            history = get_batch(model_id, engine.device, seq_len, args.history_text,
+                                args.history_skip)
+            routing["static"] = record_expert_routing(engine, history)
+
+        modes = {}
+        for spec in args.modes:
+            if spec in guest_settings:
+                settings = guest_settings[spec]
+                modes[spec] = GuestDispatch(
+                    layers, store, args.gpus_per_node, local_group, **settings,
+                    routing=routing.get(settings.get("source", "speculative")),
+                )
+            elif spec != "autoep":
+                modes[spec] = build_mode(
+                    spec, layer.num_experts, args.gpus_per_node, local_group, layer.ep_group
+                )
+            else:
+                modes[spec] = None
 
         # One untimed forward per mode: warms it up and checks its logits.
         first, reference = args.modes[0], None
         for spec, mode in modes.items():
             set_mode(engine, mode)
+            torch.cuda.reset_peak_memory_stats(engine.device)
             seconds, tail = timed_forward(engine, batch)
+            peak = torch.tensor(torch.cuda.max_memory_allocated(engine.device) / 2**30,
+                                device=engine.device)
+            torch.distributed.all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
             reference = tail if reference is None else reference
             error = (tail - reference).abs().max() / reference.abs().max()
             torch.distributed.all_reduce(error, op=torch.distributed.ReduceOp.MAX)
@@ -487,7 +548,10 @@ def main() -> None:
             torch.distributed.all_reduce(same_token)
             print0(f"{spec:>{width}}: first forward {seconds:7.3f} s | last logits differ from "
                    f"{first} by up to {error:.2e} (relative), same top token on "
-                   f"{same_token.item() / (tail.shape[0] * world_size):.1%} of the last tokens")
+                   f"{same_token.item() / (tail.shape[0] * world_size):.1%} of the last tokens "
+                   f"| peak GPU memory {peak.item():.2f} GiB on the fullest rank")
+            if isinstance(mode, GuestDispatch):
+                mode.measure(lambda: engine(**batch, use_cache=False), print0, spec)
 
         # Rounds of one timed forward per mode, each followed by a traced one of the
         # same mode, so drift over the run favors neither the modes nor the tracing.

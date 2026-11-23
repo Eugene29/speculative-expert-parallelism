@@ -37,8 +37,8 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
   routing is timed on one layer only.
 - [ ] Real replicas: load and hold the weights. `combine_dispatch --replicas` emulates
   them by rerouting. A replica per rank, not per node, is untried.
-- [ ] One plan for all slices of the pipeline. Each slice now pays a whole plan, about
-  2 ms, which is why pipelined RBD does not beat RBD.
+- [ ] One plan for all slices of the plain pipeline. `pipelined_plain_combine_dispatch`
+  still plans per slice; the RBD pipeline no longer does.
 - [ ] Plain's count exchange. It takes 1.9 ms of plain's 10 ms for a few bytes
   (Baselines 01). Tutel and DeepSpeed's MOELayer need no such exchange.
 - [ ] `even_vs_uneven.py`: count the off-rank bytes of every rank. It now multiplies
@@ -46,6 +46,14 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 
 ## Performance
 
+- [ ] Start RBD's own dispatch before the host-bound rest of its plan. The pipeline
+  does (`start_plans`, then the dispatches, then `finish_plans`); `rbd_combine_dispatch`
+  and two-lane still finish the plan first.
+- [ ] Guests without the host sync in the expert call. `GuestDispatch._run_experts`
+  reads how many rows are for the rank's own experts, to cut the sorted rows where
+  the guests begin.
+- [ ] Guests' weights in one buffer per expert. A load is three copies per guest, one
+  per weight tensor, each a call on the host.
 - [ ] A cheaper `make_plan`. It is about a quarter of an RBD round trip, mostly
   host time.
 - [ ] The pipeline over two-lane.
@@ -108,8 +116,6 @@ job scripts behind them are in [experiments/README.md](experiments/README.md).
 Each comes back as one file that imports only public names: the plan and stage
 functions of `rbd.py`, and `ops.py`.
 
-- [ ] Expert offload: experts in host memory instead of on other ranks. Measured as a
-  load time only (`benchmark/internode/expert_load.py`); keep them in pinned memory.
 - [ ] Hot-expert swaps. Replicas are back (`src/replicas.py`); swaps are not.
 - [ ] Low priority: Expert placement searches.
 - [ ] Low priority: Preemptive partition: bisect the experts by co-activation.
@@ -118,6 +124,12 @@ functions of `rbd.py`, and `ops.py`.
 
 Finished items move here with the date and where the result is written up.
 
+- [x] 2026-11-22. Why pipelining gained nothing for Tutel and RBD, and one plan for
+  all slices of the RBD pipeline, with its tail under the dispatch: 1.134x over RBD
+  in the Qwen model (Pipeline 01).
+- [x] 2026-11-22. Expert offload as guests: hot experts of other nodes loaded from
+  pinned host memory one layer ahead, chosen by the next layer's router, on two-lane
+  RBD: 1.30x over RBD and 1.10x over two-lane at 24 guests per rank (Guests 01).
 - [x] 2026-11-22. Every library in one table, on one layer and in the Qwen model, on
   2 and 4 nodes: DeepEP, Tutel, AutoEP, DeepSpeed's MOELayer, RBD, two-lane and X-MoE
   through `benchmark/all2all/modes.py` (Baselines 02), with their profiles (Profiles 01).

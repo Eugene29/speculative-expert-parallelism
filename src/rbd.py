@@ -46,6 +46,11 @@ from spec_ep.ops import all2all, gather_sum
 __all__ = [
     "PILOT_RULES",
     "Plan",
+    "token_slices",
+    "PlanStart",
+    "start_plans",
+    "finish_plans",
+    "make_plans",
     "make_plan",
     "stage1_dispatch",
     "stage2_dispatch",
@@ -169,51 +174,98 @@ def _exchange_counts(
 
 
 def _send_pilot_meta(
-    pilot_copy: torch.Tensor,
-    covered: torch.Tensor,
-    node_expert: torch.Tensor,
-    weights: torch.Tensor,
-    pilot_send: list[int],
-    pilot_recv: list[int],
+    metas: list[torch.Tensor],
+    pilot_send: list[list[int]],
+    pilot_recv: list[list[int]],
     ep_group: dist.ProcessGroup | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Send each pilot's node-local experts and weights to its rank. Collective.
+) -> list[torch.Tensor]:
+    """Send every slice's pilot metadata to the pilots' ranks in one all2all. Collective.
 
-    Weights ride as int32 bits so one all2all carries both.
+    Args:
+        metas: Per slice, the [num_pilots_sent, 2k] metadata of its pilots, by rank.
+        pilot_send: Per slice, the pilots sent to each rank of ep_group.
+        pilot_recv: Per slice, the pilots received from each rank of ep_group.
 
     Returns:
-        copy_expert: [num_pilots, k] node-local expert of each copy of each received
-            pilot, or -1 if the copy is on another node.
-        merge_weight: [num_pilots, k] combine weight of each of those copies.
+        received: Per slice, the [num_pilots, 2k] metadata of the pilots it receives,
+            by source rank.
     """
-    k = covered.shape[1]
-    pilot_token = pilot_copy // k
-    meta = torch.cat(
-        [
-            torch.where(covered, node_expert[pilot_token], -1).int(),
-            torch.where(covered, weights[pilot_token].float(), 0.0).view(torch.int32),
-        ],
-        dim=1,
+    if len(metas) == 1:
+        return [all2all(metas[0], pilot_send[0], pilot_recv[0], ep_group, link="inter")]
+    # One buffer by rank, and by slice within a rank, on both sides.
+    world, degree = len(pilot_send[0]), len(metas)
+    by_slice = [meta.split(sizes) for meta, sizes in zip(metas, pilot_send)]
+    buffer = torch.cat([by_slice[c][r] for r in range(world) for c in range(degree)])
+    received = all2all(
+        buffer,
+        [sum(sizes[r] for sizes in pilot_send) for r in range(world)],
+        [sum(sizes[r] for sizes in pilot_recv) for r in range(world)],
+        ep_group,
+        link="inter",
     )
-    meta = all2all(meta, pilot_send, pilot_recv, ep_group, link="inter")
-    return meta[:, :k], meta[:, k:].view(torch.float32)
+    pieces = received.split([pilot_recv[c][r] for r in range(world) for c in range(degree)])
+    return [torch.cat(pieces[c::degree]) for c in range(degree)]
 
 
-def make_plan(
+def token_slices(num_tokens: int, degree: int) -> list[slice]:
+    """Cut num_tokens tokens into degree contiguous slices of near-equal size.
+
+    Returns:
+        slices: Slice c is tokens num_tokens * c // degree up to
+            num_tokens * (c + 1) // degree.
+    """
+    bounds = [num_tokens * c // degree for c in range(degree + 1)]
+    return [slice(a, b) for a, b in zip(bounds, bounds[1:])]
+
+
+class PlanStart(NamedTuple):
+    """Every slice's plan up to what its stage 1 dispatch needs; finish_plans() does the rest."""
+
+    send1_token: list[torch.Tensor]  # per slice: [sum(send1)] token each stage 1 row carries
+    sizes: list[list[int]]  # per slice: send1, recv1, pilot_send, pilot_recv, send2, recv2
+    order: list[torch.Tensor]  # per slice: its copies sorted by stage 1 row
+    meta: list[torch.Tensor]  # per slice: [num_pilots, 2k] metadata of its received pilots
+    weights: torch.Tensor  # [num_tokens, k] combine weights
+    direct: torch.Tensor  # [num_tokens, k] whether a copy's expert is on this node
+    is_pilot: torch.Tensor  # [num_tokens, k] whether a copy is its node's pilot
+    direct_in: torch.Tensor  # [world, degree, L] direct rows per source rank and expert
+    stage2_in: torch.Tensor  # [degree, G, L] stage 2 rows per source rank and expert
+    rank: int  # this rank in ep_group
+    gpus_per_node: int  # ranks per node
+
+    @property
+    def send1(self) -> list[list[int]]:
+        """Per slice: stage 1 rows sent to each rank of ep_group."""
+        return [size[: self.direct_in.shape[0]] for size in self.sizes]
+
+    @property
+    def recv1(self) -> list[list[int]]:
+        """Per slice: stage 1 rows received from each rank of ep_group."""
+        world = self.direct_in.shape[0]
+        return [size[world : 2 * world] for size in self.sizes]
+
+
+def start_plans(
     route: torch.Tensor,
     weights: torch.Tensor,
     num_experts: int,
     gpus_per_node: int,
     ep_group: dist.ProcessGroup | None = None,
     pilot_rule: str = "rail",
-) -> Plan:
-    """Decide where every row goes and tell the receiving ranks. Sends no tokens.
+    degree: int = 1,
+) -> PlanStart:
+    """Plan every slice of token_slices(num_tokens, degree) as far as its stage 1 dispatch.
 
-    Collective over ep_group, with a single host sync to read every split size.
-    The arguments are those of rbd_combine_dispatch().
+    Collective over ep_group; sends no tokens. The slices share one exchange of counts
+    and one host sync, which reads the split sizes of all of them: the counts get one
+    block of columns per slice. One small all2all then carries the pilot metadata of
+    every slice. What is left, finish_plans(), is host-bound and needs no rank but
+    this one, so a caller can start the stage 1 dispatches first and finish the plans
+    while they are on the network. The arguments are those of rbd_combine_dispatch().
 
     Returns:
-        plan: The indices, split sizes and weights the five stages need.
+        start: The stage 1 rows and split sizes of every slice, and what
+            finish_plans() needs.
     """
     world, rank = dist.get_world_size(group=ep_group), dist.get_rank(group=ep_group)
     G, L = gpus_per_node, num_experts // world
@@ -237,61 +289,175 @@ def make_plan(
         expert_rank, expert_node, same, pilot_slot, rank, G, pilot_rule, pilot_offset
     )
 
+    # Columns of one slice's counts: a row per expert, the pilots, then stage 2.
     pilot_column = L
     stage2_send_start = pilot_column + 1
     stage2_recv_start = stage2_send_start + G
     C = stage2_recv_start + G * L
-    unused = world * C
+    slices = token_slices(num_tokens, degree)
+    lengths = torch.tensor([s.stop - s.start for s in slices], device=device)
+    token_slice = torch.arange(degree, device=device).repeat_interleave(lengths, output_size=num_tokens)
+    first_column = (token_slice * C).unsqueeze(1)
+    unused = world * degree * C
     stage1 = torch.where(
         direct,
-        expert_rank * C + local_expert,
-        torch.where(is_pilot, pilot_rank * C + pilot_column, unused),
+        expert_rank * degree * C + first_column + local_expert,
+        torch.where(is_pilot, pilot_rank * degree * C + first_column + pilot_column, unused),
     )
-    to_pilot = torch.where(~direct, pilot_rank * C + stage2_send_start + expert_rank % G, unused)
+    to_pilot = torch.where(
+        ~direct,
+        pilot_rank * degree * C + first_column + stage2_send_start + expert_rank % G,
+        unused,
+    )
     to_expert = torch.where(
         ~direct,
-        expert_rank * C + stage2_recv_start + (pilot_rank % G) * L + local_expert,
+        expert_rank * degree * C + first_column + stage2_recv_start
+        + (pilot_rank % G) * L + local_expert,
         unused,
     )
     slots = torch.cat([stage1.flatten(), to_pilot.flatten(), to_expert.flatten()])
-    counts, recv_counts = _exchange_counts(slots, world, C, ep_group)
+    counts, recv_counts = _exchange_counts(slots, world, degree * C, ep_group)
+    counts, recv_counts = counts.view(world, degree, C), recv_counts.view(world, degree, C)
 
-    stage2_in = recv_counts[:, stage2_recv_start:].view(world, G, L).sum(dim=0)
+    stage2_in = recv_counts[:, :, stage2_recv_start:].view(world, degree, G, L).sum(dim=0)
     sizes = torch.cat(
         [
-            counts[:, :stage2_send_start].sum(dim=1),
-            recv_counts[:, :stage2_send_start].sum(dim=1),
-            counts[:, pilot_column],
-            recv_counts[:, pilot_column],
-            recv_counts[:, stage2_send_start:stage2_recv_start].sum(dim=0),
-            stage2_in.sum(dim=1),
-        ]
+            counts[:, :, :stage2_send_start].sum(dim=2).T,
+            recv_counts[:, :, :stage2_send_start].sum(dim=2).T,
+            counts[:, :, pilot_column].T,
+            recv_counts[:, :, pilot_column].T,
+            recv_counts[:, :, stage2_send_start:stage2_recv_start].sum(dim=0),
+            stage2_in.sum(dim=2),
+        ],
+        dim=1,
     ).tolist()
+
+    stage1_key = torch.where(
+        direct,
+        expert_rank * (L + 1) + local_expert,
+        torch.where(is_pilot, pilot_rank * (L + 1) + pilot_column, world * (L + 1)),
+    )
+    node_expert = (expert_rank % G) * L + local_expert
+    lo, hi = node * G, (node + 1) * G
+
+    # Per slice: sort its stage 1 rows, and gather what its pilots' ranks must know.
+    orders, metas, tokens = [], [], []
+    for size, s in zip(sizes, slices):
+        send1 = size[:world]
+        order = stage1_key[s].flatten().sort(stable=True).indices
+        send_lo = sum(send1[:lo])
+        send_hi = send_lo + sum(send1[lo:hi])
+        pilot_copy = torch.cat([order[:send_lo], order[send_hi : sum(send1)]])
+        tokens.append(order[: sum(send1)] // k)
+        pilot_token = pilot_copy // k
+        covered = same[s].view(-1, k)[pilot_copy]
+        # Node-local experts and weights of each pilot; weights ride as int32 bits.
+        metas.append(
+            torch.cat(
+                [
+                    torch.where(covered, node_expert[s][pilot_token], -1).int(),
+                    torch.where(covered, weights[s][pilot_token].float(), 0.0).view(torch.int32),
+                ],
+                dim=1,
+            )
+        )
+        orders.append(order)
+    metas = _send_pilot_meta(
+        metas,
+        [size[2 * world : 3 * world] for size in sizes],
+        [size[3 * world : 4 * world] for size in sizes],
+        ep_group,
+    )
+    return PlanStart(
+        tokens, sizes, orders, metas, weights, direct, is_pilot, recv_counts[:, :, :L],
+        stage2_in, rank, G,
+    )
+
+
+def finish_plans(start: PlanStart) -> list[Plan]:
+    """Build every slice's Plan from start_plans(). No communication and no host sync.
+
+    Returns:
+        plans: One Plan per slice, each as if its tokens were a layer of their own.
+    """
+    slices = token_slices(start.weights.shape[0], len(start.sizes))
+    return [
+        _finish_plan(
+            start.sizes[c], start.order[c], start.meta[c], start.weights[s], start.direct[s],
+            start.is_pilot[s], start.direct_in[:, c], start.stage2_in[c], start.rank,
+            start.gpus_per_node,
+        )
+        for c, s in enumerate(slices)
+    ]
+
+
+def make_plans(
+    route: torch.Tensor,
+    weights: torch.Tensor,
+    num_experts: int,
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None = None,
+    pilot_rule: str = "rail",
+    degree: int = 1,
+) -> list[Plan]:
+    """Plan every slice of token_slices(num_tokens, degree) at once. Sends no tokens.
+
+    Collective over ep_group: start_plans(), then finish_plans(). The arguments are
+    those of rbd_combine_dispatch().
+
+    Returns:
+        plans: One Plan per slice, each as if its tokens were a layer of their own.
+    """
+    return finish_plans(
+        start_plans(route, weights, num_experts, gpus_per_node, ep_group, pilot_rule, degree)
+    )
+
+
+def _finish_plan(
+    sizes: list[int],
+    order: torch.Tensor,
+    meta: torch.Tensor,
+    weights: torch.Tensor,
+    direct: torch.Tensor,
+    is_pilot: torch.Tensor,
+    direct_in: torch.Tensor,
+    stage2_in: torch.Tensor,
+    rank: int,
+    gpus_per_node: int,
+) -> Plan:
+    """Build one slice's Plan from its split sizes and the metadata of its pilots.
+
+    Args:
+        sizes: The slice's send1, recv1, pilot_send and pilot_recv per rank of
+            ep_group, then send2 and recv2 per rank of the node.
+        order: [num_tokens * k] the slice's copies sorted by stage 1 row: by
+            destination rank, then expert, with pilots after a rank's experts, and
+            the copies that send no row last.
+        meta: [num_pilots, 2k] for each received pilot, the node-local expert of
+            each of its copies, or -1 for a copy on another node, then the combine
+            weights as int32 bits.
+        direct: [num_tokens, k] whether the copy's expert is on this node.
+        is_pilot: [num_tokens, k] whether the copy is its node's pilot.
+        direct_in: [world, L] direct rows each rank sends to each expert here.
+        stage2_in: [G, L] stage 2 rows each rank of the node sends to each expert here.
+
+    Returns:
+        plan: The slice's indices, split sizes and weights.
+    """
+    world, G = direct_in.shape[0], gpus_per_node
+    L = direct_in.shape[1]
+    node = rank // G
+    num_tokens, k = direct.shape
+    device = order.device
     send1, recv1 = sizes[:world], sizes[world : 2 * world]
-    pilot_send, pilot_recv = sizes[2 * world : 3 * world], sizes[3 * world : 4 * world]
+    pilot_recv = sizes[3 * world : 4 * world]
     send2, recv2 = sizes[4 * world : 4 * world + G], sizes[4 * world + G :]
 
     num_send1 = sum(send1)
-    stage1_key = torch.where(stage1 < unused, stage1 // C * (L + 1) + stage1 % C, unused)
-    order = stage1_key.flatten().sort(stable=True).indices
-    sent = order[:num_send1]
-
     lo, hi = node * G, (node + 1) * G
-    send_lo = sum(send1[:lo])
-    send_hi = send_lo + sum(send1[lo:hi])
     recv_lo = sum(recv1[:lo])
     num_direct = sum(recv1[lo:hi])
-
-    pilot_copy = torch.cat([sent[:send_lo], sent[send_hi:]])
-    copy_expert, merge_weight = _send_pilot_meta(
-        pilot_copy,
-        same.view(-1, k)[pilot_copy],
-        (expert_rank % G) * L + local_expert,
-        weights,
-        pilot_send,
-        pilot_recv,
-        ep_group,
-    )
+    copy_expert, merge_weight = meta[:, :k], meta[:, k:].view(torch.float32)
 
     num_pilots = sum(pilot_recv)
     pilot_row = torch.arange(num_pilots, device=device)
@@ -306,7 +472,7 @@ def make_plan(
 
     expert_ids = torch.cat(
         [
-            _expert_ids(recv_counts[lo:hi, :L], rank * L, num_direct),
+            _expert_ids(direct_in[lo:hi], rank * L, num_direct),
             _expert_ids(stage2_in, rank * L, sum(recv2)),
         ]
     )
@@ -318,7 +484,7 @@ def make_plan(
     final_weight = torch.where(direct, weights.float(), is_pilot.float())
 
     return Plan(
-        send1_token=sent // k,
+        send1_token=order[:num_send1] // k,
         send1=send1,
         recv1=recv1,
         direct=(recv_lo, recv_lo + num_direct),
@@ -332,6 +498,25 @@ def make_plan(
         final_index=final_index,
         final_weight=final_weight,
     )
+
+
+def make_plan(
+    route: torch.Tensor,
+    weights: torch.Tensor,
+    num_experts: int,
+    gpus_per_node: int,
+    ep_group: dist.ProcessGroup | None = None,
+    pilot_rule: str = "rail",
+) -> Plan:
+    """Decide where every row goes and tell the receiving ranks. Sends no tokens.
+
+    Collective over ep_group, with a single host sync to read every split size.
+    The arguments are those of rbd_combine_dispatch().
+
+    Returns:
+        plan: The indices, split sizes and weights the five stages need.
+    """
+    return make_plans(route, weights, num_experts, gpus_per_node, ep_group, pilot_rule)[0]
 
 
 def stage1_dispatch(
